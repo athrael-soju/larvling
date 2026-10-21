@@ -95,11 +95,21 @@ def _names(text):
     return found
 
 
+def _first_word(text):
+    found = re.findall(r"\w+", text or "")
+    return found[0] if found else ""
+
+
 def differ_in_kind(a, b):
     """True if a word only one of *a* and *b* has changes what it says: a
     number, a date, a name, or a negation. "Pay the March invoice" and "Pay the
-    April invoice" overlap a lot, but aren't the same task."""
+    April invoice" overlap a lot, but aren't the same task. Two texts opening
+    with different capitalised words ("Alice opts out", "Bobby opts out") may
+    be about different people, so they differ too."""
     if bool(NEGATION.search(a or "")) != bool(NEGATION.search(b or "")):
+        return True
+    fa, fb = _first_word(a), _first_word(b)
+    if fa[:1].isupper() and fb[:1].isupper() and _stem(fa.lower()) != _stem(fb.lower()):
         return True
     sa = {_stem(w) for w in words(a)}
     sb = {_stem(w) for w in words(b)}

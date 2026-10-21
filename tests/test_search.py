@@ -366,6 +366,8 @@ class SimilarityTest(unittest.TestCase):
             ("We decided to use SQLite for the cache", "We decided not to use SQLite for the cache", True),
             ("We don't deploy on Fridays", "We deploy on Fridays", True),
             ("Upgrade billing to Python 3.12", "Upgrade billing to Python 3.13", True),
+            ("Alice opts out of the weekly status meeting this quarter",
+             "Bobby opts out of the weekly status meeting this quarter", True),
             ("Refactor the auth modules", "auth module refactor", False),
             ("Set up the CI pipeline", "Set up CI pipelines", False),
             ("Fix the login bug on iOS", "Fix login bugs on iOS", False),
