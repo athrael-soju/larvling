@@ -40,7 +40,7 @@ Classify knowledge into one of: `personal`, `professional`, `preferences`, `inte
 3. **Execute** the appropriate SQL. Every statement you write records its provenance: `source = 'manual'`, a `kind`, and this session. Pick `kind` from `fact` (something true about the world, the user or their work), `decision` (a choice the user has made), `preference` (how the user likes things done), or `assessment` (a judgement or recommendation rather than an established fact). Keep the `session_id` subquery exactly as written below.
    - New topic: `INSERT INTO topics (title, domain, tags) VALUES ('...', '...', '...')`, then add its first statement with `topic_id = (SELECT MAX(id) FROM topics WHERE title = '...')` in the new-statement SQL below
    - New statement: `INSERT INTO statements (topic_id, claim, source, kind, session_id) VALUES (N, '...', 'manual', '<kind>', (SELECT id FROM sessions WHERE id = '${CLAUDE_SESSION_ID}'))`
-   - Update statement: `UPDATE statements SET claim = '...', source = 'manual', kind = '<kind>', session_id = (SELECT id FROM sessions WHERE id = '${CLAUDE_SESSION_ID}'), updated = datetime('now') WHERE id = N`
+   - Update statement: `UPDATE statements SET claim = '...', source = 'manual', kind = '<kind>', session_id = COALESCE((SELECT id FROM sessions WHERE id = '${CLAUDE_SESSION_ID}'), session_id), updated = datetime('now') WHERE id = N`
    - Update topic: `UPDATE topics SET title = '...', tags = '...', updated = datetime('now') WHERE id = N`
 4. **Confirm** — use AskUserQuestion (type: Knowledge) to show what was stored:
    ```

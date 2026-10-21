@@ -168,4 +168,4 @@ All data is stored locally in the project's `.claude/` directory:
 - `larvling.db` - SQLite database (WAL mode) with sessions, messages, knowledge, and tasks
 - `larvling.jsonl` - structured JSONL debug log (one JSON object per line, machine-parseable)
 
-When the plugin updates with schema changes, Larvling automatically backs up your database (`larvling.db.v<old-version>.bak`) and migrates it at session start. If an upgrade has no automatic path, it guides the agent through the migration instead - your data is preserved either way.
+When the plugin updates with schema changes, Larvling automatically backs up your database (`larvling.db.v<old-version>.bak`, or `larvling.db.v<old-version>.<timestamp>.bak` if that name is taken, so no backup is ever overwritten) and migrates it at session start. If an upgrade has no automatic path, it guides the agent through the migration instead - your data is preserved either way.
