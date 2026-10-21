@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -140,7 +141,69 @@ class SourcingRulesTest(unittest.TestCase):
         self.assertEqual(len(self.stored([loose], user, "")), 1)
         scattered = item(claim="Solo project", evidence="working solo project")
         paraphrase = item(claim="Single developer", evidence="I am a single developer")
-        self.assertEqual(len(self.stored([scattered, paraphrase], user, "")), 1)
+        part_word = item(claim="Small project", evidence="mall side project")
+        self.assertEqual(len(self.stored([scattered, paraphrase, part_word], user, "")), 1)
+
+    def test_evidence_needs_three_words_and_an_endorsement_two(self):
+        # Every quote here is in the exchange, but a word or two turns up anywhere.
+        user = "I want CI for my project. Thanks, agreed."
+        agent = "Honestly, your pipeline is over-engineered for a team of three."
+        assessment = item(claim="The CI pipeline is over-engineered", source="agent",
+                          kind="assessment", evidence="your pipeline is over-engineered")
+        too_short = [
+            item(claim="Wants CI", evidence="I"),
+            item(claim="Wants CI", evidence="my project"),
+            dict(assessment, endorsement="thanks"),
+        ]
+        self.assertEqual(self.stored(too_short, user, agent), [])
+        self.assertEqual(
+            [e["reason"] for e in support.logged("extraction_skipped")],
+            ["evidence too short", "evidence too short", "endorsement too short"],
+        )
+        long_enough = [
+            item(claim="Wants CI", evidence="I want CI"),
+            dict(assessment, endorsement="Thanks, agreed"),
+        ]
+        self.assertEqual(
+            [r["claim"] for r in self.stored(long_enough, user, agent)],
+            ["Wants CI", "The CI pipeline is over-engineered"],
+        )
+
+    def test_about_must_be_given_and_valid(self):
+        fact = item(topic_title="GitHub Actions", claim="GitHub Actions reuses workflows",
+                    domain="technical", source="agent", kind="fact",
+                    evidence="GitHub Actions supports reusable workflows")
+        missing = {k: v for k, v in fact.items() if k != "about"}
+        for bad in (missing, dict(fact, about=None), dict(fact, about="world")):
+            with self.subTest(about=bad.get("about", "missing")):
+                self.assertEqual(self.stored([bad], SPECULATIVE_USER, SPECULATIVE_AGENT), [])
+
+    def test_an_update_is_checked_like_a_new_statement(self):
+        stated = item(evidence="I'm working solo on a small side project")
+        self.stored([stated], STATED_USER, STATED_AGENT)
+        # A later exchange can't rewrite the user's fact with the agent's words.
+        rewrites = [
+            item(action="update_statement", statement_id=1, claim="Works solo with one workflow file",
+                 evidence="one workflow file is plenty"),
+            item(action="update_statement", statement_id=1, claim="Works solo with one workflow file",
+                 source="agent", evidence="one workflow file is plenty"),
+        ]
+        self.assertEqual(
+            self.stored(rewrites, SPECULATIVE_USER, SPECULATIVE_AGENT),
+            [{"claim": SOLO_CLAIM, "source": "user", "kind": "fact"}],
+        )
+
+    def test_null_fields_skip_the_item_without_failing(self):
+        stated = item(evidence="I'm working solo on a small side project")
+        fields = ("action", "claim", "topic_title", "domain", "tags", "source", "kind",
+                  "about", "evidence")
+        nulls = [{**stated, "claim": f"{field} is null", field: None} for field in fields]
+        nulls.append(item(claim="endorsement is null", source="agent", kind="assessment",
+                          evidence="one workflow file is plenty", endorsement=None))
+        self.assertEqual(
+            self.stored(nulls + [stated], STATED_USER, SPECULATIVE_AGENT),
+            [{"claim": SOLO_CLAIM, "source": "user", "kind": "fact"}],
+        )
 
 
 class AssessmentContextTest(unittest.TestCase):
@@ -169,8 +232,13 @@ class AssessmentContextTest(unittest.TestCase):
 
 
 def _mentions_solo(claim):
-    claim = claim.lower()
-    return "solo" in claim or "side project" in claim
+    """True if *claim* restates "works solo on a small side project", however worded."""
+    return bool(re.search(
+        r"\bsolo\b|\balone\b|\bsole\b|\bindependently\b|\bon (his|her|their) own\b"
+        r"|\bby (him|her|them)sel(f|ves)\b|\b(single|one)[- ](person|man|developer|dev|maintainer)\b"
+        r"|\b(side|personal|hobby|pet)[- ]project\b",
+        claim.lower(),
+    ))
 
 
 @unittest.skipUnless(
@@ -187,7 +255,14 @@ class LiveExtractionTest(unittest.TestCase):
                 "role": "assistant", "content": [{"type": "text", "text": agent_text}]}}) + "\n")
         analyze._run({"session_id": SID, "transcript_path": path})
         with db.open_db() as conn:
-            return [dict(r) for r in conn.execute("SELECT claim, source, kind FROM statements")]
+            ran = conn.execute(
+                "SELECT 1 FROM messages WHERE role = 'system' AND content LIKE 'Extraction:%'"
+            ).fetchone()
+            rows = [dict(r) for r in conn.execute("SELECT claim, source, kind FROM statements")]
+        # _run logs and swallows a failed model call, which would leave no
+        # statements and pass the speculation test for the wrong reason.
+        self.assertTrue(ran, support.logged("extraction_error"))
+        return rows
 
     def test_agent_speculation_about_the_user_produces_no_statement(self):
         rows = self.extract(SPECULATIVE_USER, SPECULATIVE_AGENT)

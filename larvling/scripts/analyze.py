@@ -55,6 +55,10 @@ ALLOWED_SOURCING = {
     ("agent", "fact"),
     ("agent", "assessment"),
 }
+# Shortest evidence and endorsement accepted, in words: a word or two ("I",
+# "my project", "thanks") turns up in almost any message.
+MIN_EVIDENCE_WORDS = 3
+MIN_ENDORSEMENT_WORDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +172,11 @@ with, or general domain knowledge), "decision" (a choice the user has made), \
 AGENT judgement the USER explicitly agreed with — nothing else)
 - about: "user" (the user, their work, or the people they deal with) or "domain" \
 (general knowledge, true no matter who is asking)
-- evidence: a short span copied word for word from the source's message that supports \
-the claim. Do not paraphrase: an item whose evidence is not in that message is discarded.
-- endorsement: for kind "assessment" only, the USER's words agreeing with it, copied \
-word for word; otherwise ""
+- evidence: a span of at least three words copied word for word from the source's \
+message that supports the claim. Do not paraphrase: an item whose evidence is not in \
+that message, or is shorter than three words, is discarded.
+- endorsement: for kind "assessment" only, the USER's words agreeing with it, at least \
+two words copied word for word; otherwise ""
 - Allowed: source "user" with kind fact, decision or preference; source "agent" with \
 kind "fact" and about "domain", or kind "assessment" with an endorsement. Anything else \
 is discarded.
@@ -295,6 +300,11 @@ def _parse_id(value, field_name, action, session_id):
         return None
 
 
+def _field(item, key):
+    """Return *item*[*key*] as stripped text; a missing or null value gives ""."""
+    return str(item.get(key) or "").strip()
+
+
 def _words(text):
     """Return the lowercase words of *text*, ignoring punctuation and spacing."""
     return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text or "").casefold()))
@@ -312,31 +322,41 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
     The evidence must appear in the source's message, and an assessment also
     needs the user's endorsement. Returns (source, kind) or None (with logging).
     """
-    source = item.get("source", "").strip().lower()
+    source = _field(item, "source").lower()
     if source not in VALID_SOURCE:
         _skip(session_id, action, "invalid source", source=source)
         return None
-    kind = item.get("kind", "").strip().lower()
+    kind = _field(item, "kind").lower()
     if kind not in VALID_KIND:
         _skip(session_id, action, "invalid kind", kind=kind)
         return None
     if (source, kind) not in ALLOWED_SOURCING:
         _skip(session_id, action, "kind not allowed from source", source=source, kind=kind)
         return None
-    about = item.get("about", "").strip().lower()
+    about = _field(item, "about").lower()
     if about not in VALID_ABOUT:
         _skip(session_id, action, "invalid about", about=about)
         return None
     if source == "agent" and kind == "fact" and about == "user":
         _skip(session_id, action, "agent claim about the user")
         return None
-    evidence = item.get("evidence", "")
+    # These checks prove only that the quotes are in the exchange, not that
+    # they support the claim; the minimum length stops a stray word passing.
+    evidence = _field(item, "evidence")
     if not _quoted_in(evidence, user_text if source == "user" else agent_text):
         _skip(session_id, action, f"evidence not in {source} text", evidence=evidence[:80])
         return None
-    if kind == "assessment" and not _quoted_in(item.get("endorsement", ""), user_text):
-        _skip(session_id, action, "assessment not endorsed by user")
+    if len(_words(evidence).split()) < MIN_EVIDENCE_WORDS:
+        _skip(session_id, action, "evidence too short", evidence=evidence[:80])
         return None
+    if kind == "assessment":
+        endorsement = _field(item, "endorsement")
+        if not _quoted_in(endorsement, user_text):
+            _skip(session_id, action, "assessment not endorsed by user")
+            return None
+        if len(_words(endorsement).split()) < MIN_ENDORSEMENT_WORDS:
+            _skip(session_id, action, "endorsement too short", endorsement=endorsement[:80])
+            return None
     return source, kind
 
 
@@ -360,7 +380,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
     topics_updated = 0
 
     for item in knowledge_list:
-        action = item.get("action", "").strip().lower()
+        action = _field(item, "action").lower()
         if action not in (
             "add_topic",
             "add_statement",
@@ -378,12 +398,12 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             ).fetchone():
                 _skip(session_id, action, "topic not found", topic_id=topic_id)
                 continue
-            title = item.get("topic_title", "").strip()
-            domain = item.get("domain", "").strip().lower()
+            title = _field(item, "topic_title")
+            domain = _field(item, "domain").lower()
             if domain and domain not in VALID_DOMAINS:
                 _skip(session_id, action, "invalid domain", domain=domain)
                 continue
-            tags = item.get("tags", "").strip()
+            tags = _field(item, "tags")
             if title:
                 conn.execute(
                     "UPDATE topics SET title = ?, domain = COALESCE(?, domain), "
@@ -399,7 +419,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             )
             if stmt_id is None:
                 continue
-            claim = item.get("claim", "").strip()
+            claim = _field(item, "claim")
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
@@ -423,7 +443,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             topic_id = _parse_id(item.get("topic_id"), "topic_id", action, session_id)
             if topic_id is None:
                 continue
-            claim = item.get("claim", "").strip()
+            claim = _field(item, "claim")
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
@@ -450,19 +470,19 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             continue
 
         # add_topic: new topic + first statement
-        claim = item.get("claim", "").strip()
+        claim = _field(item, "claim")
         if not claim:
             _skip(session_id, action, "missing claim")
             continue
-        topic_title = item.get("topic_title", "").strip()
+        topic_title = _field(item, "topic_title")
         if not topic_title:
             _skip(session_id, action, "missing topic_title")
             continue
-        domain = item.get("domain", "").strip().lower()
+        domain = _field(item, "domain").lower()
         if not domain or domain not in VALID_DOMAINS:
             _skip(session_id, action, "invalid domain", domain=domain)
             continue
-        tags = item.get("tags", "").strip()
+        tags = _field(item, "tags")
         if not tags:
             _skip(session_id, action, "missing tags")
             continue
