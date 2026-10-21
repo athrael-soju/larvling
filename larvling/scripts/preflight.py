@@ -6,10 +6,12 @@ prints both schemas for the agent to migrate.
 """
 
 import bisect
+import hashlib
 import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -416,6 +418,21 @@ def ensure_schema():
 
 
 MIN_SDK_VERSION = "0.2.170"
+# A background install of the SDK for this Python writes pip's output here,
+# then "exit <code>" once pip is done. It belongs to the Python environment,
+# not the project, so it lives in the temp directory.
+SDK_INSTALL_LOG = os.path.join(
+    tempfile.gettempdir(),
+    "larvling-sdk-%s.log" % hashlib.sha1(sys.executable.encode()).hexdigest()[:12],
+)
+# An install without an exit line after this long was killed or has stalled.
+SDK_INSTALL_STALE_SECONDS = 1800
+_PIP_WRAPPER = (
+    "import subprocess, sys\n"
+    "with open(sys.argv[1], 'a') as log:\n"
+    "    code = subprocess.run(sys.argv[2:], stdout=log, stderr=log).returncode\n"
+    "    log.write(f'\\nexit {code}\\n')\n"
+)
 
 
 def sdk_outdated(version):
@@ -425,17 +442,40 @@ def sdk_outdated(version):
     return parts(version) < parts(MIN_SDK_VERSION)
 
 
-def check_dependencies():
-    """Install claude-agent-sdk, or upgrade it to MIN_SDK_VERSION, if needed.
+def _install_sdk_in_background(spec):
+    """Start pip in a process that outlives the hook, unless one is running."""
+    import subprocess
 
-    Returns False, after telling the user how to install it, if that fails.
+    try:
+        os.close(os.open(SDK_INSTALL_LOG, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return  # another session started one first
+    subprocess.Popen(
+        [sys.executable, "-c", _PIP_WRAPPER, SDK_INSTALL_LOG,
+         sys.executable, "-m", "pip", "install", "--quiet", spec],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        start_new_session=(os.name != "nt"),
+    )
+
+
+def check_dependencies():
+    """Make sure claude-agent-sdk MIN_SDK_VERSION or later is installed.
+
+    Downloading the SDK takes longer than the SessionStart hook may run, so a
+    missing or outdated SDK is installed in the background, and the next
+    session start says if that failed. Returns True if the SDK is ready.
     """
     try:
         import claude_agent_sdk
-        installed = claude_agent_sdk.__version__
+        installed = getattr(claude_agent_sdk, "__version__", "")
     except ImportError:
         installed = None
     if installed and not sdk_outdated(installed):
+        if os.path.exists(SDK_INSTALL_LOG):
+            os.remove(SDK_INSTALL_LOG)
         return True
 
     if sys.version_info < (3, 10):
@@ -445,21 +485,37 @@ def check_dependencies():
         print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
         return False
 
-    import subprocess
     spec = f"claude-agent-sdk>={MIN_SDK_VERSION}"
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", spec],
-                            capture_output=True, text=True)
-    if result.returncode == 0:
-        return True
-    state = f"{installed} is older than {MIN_SDK_VERSION}" if installed else "is missing"
-    print("# Larvling - Missing Dependency\n")
-    print(f"`claude-agent-sdk` {state} and could not be installed automatically. Install it manually:\n")
-    print("```bash")
-    print(f"{sys.executable} -m pip install --upgrade '{spec}'")
-    print("```\n")
-    if result.stderr:
-        print(f"Error: {result.stderr.strip()}\n")
-    print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
+    state = f"{installed}, older than {MIN_SDK_VERSION}" if installed else "missing"
+    try:
+        with open(SDK_INSTALL_LOG, encoding="utf-8", errors="replace") as f:
+            previous = f.read()
+        running = ("\nexit " not in previous and
+                   time.time() - os.path.getmtime(SDK_INSTALL_LOG) < SDK_INSTALL_STALE_SECONDS)
+    except OSError:
+        previous, running = None, False
+
+    if running:
+        print("# Larvling - Installing Dependency\n")
+        print(f"`claude-agent-sdk` is {state} and is being installed in the background. "
+              "Knowledge extraction, session tags, and task tracking resume once it is done.")
+        return False
+    if previous is not None:
+        print("# Larvling - Missing Dependency\n")
+        print(f"`claude-agent-sdk` is {state}, and installing it in the background failed. "
+              "Larvling is trying again; to install it yourself, run:\n")
+        print("```bash")
+        print(f"{sys.executable} -m pip install --upgrade '{spec}'")
+        print("```\n")
+        tail = previous.strip().splitlines()[-6:]
+        if tail:
+            print("pip's last output:\n```\n" + "\n".join(tail) + "\n```\n")
+        os.remove(SDK_INSTALL_LOG)
+    else:
+        print("# Larvling - Installing Dependency\n")
+        print(f"`claude-agent-sdk` is {state}; installing it in the background. "
+              "Knowledge extraction, session tags, and task tracking start once it is done.")
+    _install_sdk_in_background(spec)
     return False
 
 

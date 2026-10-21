@@ -71,18 +71,29 @@ def clear_failure():
         pass
 
 
-# A transcript names how it was started ("cli", "sdk-py", ...) within its first
-# few entries. Agent SDK sessions, such as extraction's before it stopped saving
-# transcripts, are never recorded, so the check skips them.
-def _written_by_sdk(path):
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for _, line in zip(range(50), f):
-            try:
-                entrypoint = json.loads(line).get("entrypoint")
-            except (ValueError, AttributeError):
-                continue
-            if entrypoint:
-                return entrypoint.startswith("sdk")
+# Larvling's extraction prompt has opened with this in every version. Calls made
+# before extraction stopped saving transcripts left one per call next to the
+# sessions, and those aren't sessions Larvling records.
+_EXTRACTION_PROMPT_START = "Analyze this conversation"
+
+
+def _not_a_session(path):
+    """True for an extraction call's transcript, or one that can't be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(50), f):
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") != "user":
+                        continue
+                    content = entry["message"]["content"]
+                except (ValueError, AttributeError, KeyError, TypeError):
+                    continue
+                if isinstance(content, list):
+                    content = next((b.get("text", "") for b in content if isinstance(b, dict)), "")
+                return str(content).startswith(_EXTRACTION_PROMPT_START)
+    except OSError:
+        return True
     return False
 
 
@@ -144,7 +155,7 @@ def recording_gap(conn, payload):
     for _, stem, full in entries:
         if stem in recorded or missing >= _HEALTH_WINDOW:
             break
-        if not _written_by_sdk(full):
+        if not _not_a_session(full):
             missing += 1
 
     return missing if missing >= _GAP_THRESHOLD else 0
