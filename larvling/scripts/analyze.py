@@ -540,12 +540,13 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 continue
             if old["claim"] == claim:
                 continue
-            # The new claim may already be current (a legacy correction stored
-            # next to what it corrects): point at it instead of a second copy.
+            # The new claim may already be current in the same topic (a legacy
+            # correction stored next to what it corrects): point at it instead
+            # of a second copy.
             existing = conn.execute(
-                "SELECT id FROM current_statements WHERE claim = ? AND id != ? "
-                "ORDER BY id DESC LIMIT 1",
-                (claim, stmt_id),
+                "SELECT id FROM current_statements WHERE claim = ? AND topic_id = ? "
+                "AND id != ? ORDER BY id DESC LIMIT 1",
+                (claim, old["topic_id"], stmt_id),
             ).fetchone()
             if existing:
                 new_id = existing["id"]

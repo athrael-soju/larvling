@@ -154,6 +154,18 @@ class SupersedeTest(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT superseded_by FROM statements WHERE id = 1").fetchone()[0], 2)
 
+    def test_the_same_claim_in_another_topic_is_not_the_replacement(self):
+        self.conn.execute("INSERT INTO topics (id, title, domain, tags) VALUES (2, 'Advice', 'technical', 'x')")
+        self.conn.execute(
+            "INSERT INTO statements (id, topic_id, claim, source, kind) "
+            "VALUES (2, 2, 'Production database is PostgreSQL 15', 'agent', 'assessment')"
+        )
+        self.supersede()
+        self.assertEqual(self.current(), [(2, 2, "Production database is PostgreSQL 15"),
+                                          (3, 1, "Production database is PostgreSQL 15")])
+        row = self.conn.execute("SELECT source, kind FROM statements WHERE id = 3").fetchone()
+        self.assertEqual(tuple(row), ("user", "fact"))
+
 
 PLUGIN_DIR = os.path.join(support.SCRIPTS_DIR, "..")
 
