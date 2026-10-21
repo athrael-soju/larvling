@@ -11,6 +11,7 @@ from config import get_config
 from db import (
     SCHEMA_VERSION,
     escape_like,
+    log,
     get_plugin_version,
     get_summary,
     has_table,
@@ -18,6 +19,7 @@ from db import (
     reconfigure_stdout,
     get_schema_version,
 )
+from decay import decay_tasks, drop_candidates
 from health import recording_gap, pending_failure, clear_failure
 from hooks_util import spawn_with_payload
 
@@ -229,6 +231,10 @@ def get_time_and_location(enable_geo=True):
     return " — ".join(parts)
 
 
+def _due(task):
+    return f" (due {task['due']})" if task["due"] else ""
+
+
 def get_session_context():
     """Build curated session context from summaries and relevant sessions."""
     with open_db() as conn:
@@ -302,11 +308,19 @@ def get_session_context():
         # below a threshold, list them all (unchanged for healthy DBs); above it, inject
         # a rollup + the top slice and point at a scoped query for the rest.
         if has_table(conn, "tasks"):
+            promoted, demoted = [], []
+            if cfg["task_tracking"]:
+                try:
+                    promoted, demoted = decay_tasks(conn, cfg)
+                    conn.commit()
+                except Exception as e:  # a locked DB must not cost the briefing
+                    conn.rollback()
+                    log("decay_error", error=str(e))
             total_open = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'open'"
             ).fetchone()[0]
             open_tasks = conn.execute(
-                "SELECT id, title, priority, horizon FROM tasks "
+                "SELECT id, title, priority, horizon, due FROM tasks "
                 "WHERE status = 'open' "
                 "ORDER BY CASE horizon WHEN 'now' THEN 1 WHEN 'soon' THEN 2 ELSE 3 END, "
                 "CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END"
@@ -317,7 +331,7 @@ def get_session_context():
                 if total_open <= LIST_ALL_MAX:
                     lines.append(f"## Open Tasks ({total_open})")
                     for t in open_tasks:
-                        lines.append(f"- [{t['priority']}/{t['horizon']}] {t['title']}")
+                        lines.append(f"- [{t['priority']}/{t['horizon']}] {t['title']}{_due(t)}")
                 else:
                     # Too many to list in full. Emit the shape (a rollup -- never capped),
                     # then list the actionable 'now' horizon COMPLETELY: bounded by urgency,
@@ -341,11 +355,37 @@ def get_session_context():
                     now_tasks = buckets["now"]
                     if 0 < len(now_tasks) <= NOW_LIST_MAX:
                         for t in now_tasks:
-                            lines.append(f"- [{t['priority']}/now] {t['title']}")
+                            lines.append(f"- [{t['priority']}/now] {t['title']}{_due(t)}")
                         lines.append("(now listed in full; query a scope for soon/later detail)")
                     else:
                         hint = "horizon='now'" if now_tasks else "horizon='soon'"
                         lines.append(f"(query a scope for detail, e.g. {hint} or priority='high')")
+                moved = []
+                if promoted:
+                    moved.append(f"{len(promoted)} to now (due within {cfg['due_soon_days']} days)")
+                if demoted:
+                    moved.append(
+                        f"{len(demoted)} from now to soon (untouched {cfg['decay_now_days']}+ days)"
+                    )
+                if moved:
+                    lines.append(f"Moved automatically: {'; '.join(moved)}.")
+                lines.append("")
+
+            stale = drop_candidates(conn, cfg) if cfg["task_tracking"] else []
+            if stale:
+                DROP_LIST_MAX = 10  # the oldest; the rest are a query away
+                lines.append(
+                    f"## Drop Candidates ({len(stale)}) - soon, untouched "
+                    f"{cfg['decay_soon_days']}+ days"
+                )
+                for t in stale[:DROP_LIST_MAX]:
+                    lines.append(f"- [{t['id']}] {t['title']} ({t['age']} days)")
+                if len(stale) > DROP_LIST_MAX:
+                    lines.append(
+                        f"({len(stale) - DROP_LIST_MAX} more; query status='open' AND "
+                        f"horizon='soon' AND updated < datetime('now', "
+                        f"'-{cfg['decay_soon_days']} days'))"
+                    )
                 lines.append("")
 
         # Fallback: if no summaries, show recent data

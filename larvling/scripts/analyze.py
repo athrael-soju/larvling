@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import unicodedata
+from datetime import date
 
 from config import get_config
 from db import (
@@ -212,12 +213,14 @@ two words copied word for word; otherwise ""
 kind "fact" and about "domain", or kind "assessment" with an endorsement. Anything else \
 is discarded.
 
-Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high", "horizon": "now|soon|later", "status": "open|done|dropped", "action": "add_task|add_update|update_task", "task_id": N, "content": "..."}}
+Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high", "horizon": "now|soon|later", "status": "open|done|dropped", "due": "YYYY-MM-DD", "action": "add_task|add_update|update_task", "task_id": N, "content": "..."}}
 - "content" is used for add_update (the fact/note) and update_task (the reason for the change)
 - domain: same as knowledge domains
 - priority: how important (low/medium/high)
 - horizon: when to act (now/soon/later)
 - status: open (default), done (completed), dropped (no longer relevant)
+- due: the date the task must be done by, only when the USER gives one ("by Friday" \
+is resolved against the date the conversation took place); otherwise leave it out
 
 Return JSON:
 {{
@@ -288,6 +291,7 @@ EXTRACTION_SCHEMA = {
                     },
                     "task_id": {"type": "integer"},
                     "content": {"type": "string"},
+                    "due": {"type": "string"},
                 },
                 "required": ["action"],
             },
@@ -314,10 +318,11 @@ def format_transcript(messages):
     return "\n\n".join(lines)
 
 
-def build_extraction_prompt(messages, session_id="", part=None):
+def build_extraction_prompt(messages, session_id="", part=None, day=None):
     """Format the extraction prompt for *messages*, (id, role, content) tuples.
 
-    *part* is (n, total) when the messages are one chunk of a longer run.
+    *part* is (n, total) when the messages are one chunk of a longer run, and
+    *day* the date the conversation took place.
     """
     if part and part[1] > 1:
         scope = (
@@ -326,6 +331,8 @@ def build_extraction_prompt(messages, session_id="", part=None):
         )
     else:
         scope = "It is a whole session, or the part of it not yet extracted."
+    if day:
+        scope += f" It took place on {day}."
     scripts = os.path.dirname(__file__)
     query_script = os.path.join(scripts, "query.py")
     search_script = os.path.join(scripts, "search.py")
@@ -347,6 +354,19 @@ def build_extraction_prompt(messages, session_id="", part=None):
 def _skip(session_id, action, reason, **extra):
     """Log a skipped extraction item."""
     log("extraction_skipped", session_id, action=action, reason=reason, **extra)
+
+
+def _parse_due(task, action, session_id):
+    """Return the task's due date as YYYY-MM-DD, "" if it has none, or None if
+    it is not a valid date (with logging)."""
+    due = _field(task, "due")
+    if not due:
+        return ""
+    try:
+        return date.fromisoformat(due).isoformat()
+    except ValueError:
+        _skip(session_id, action, "invalid due", due=due[:40])
+        return None
 
 
 def _parse_id(value, field_name, action, session_id):
@@ -683,6 +703,8 @@ def process_tasks(conn, tasks_list, session_id=None):
                 "INSERT INTO updates (task_id, content) VALUES (?, ?)",
                 (task_id, content),
             )
+            # updated means last touched, which decay goes by.
+            conn.execute("UPDATE tasks SET updated = datetime('now') WHERE id = ?", (task_id,))
             updates_inserted += 1
             continue
 
@@ -725,6 +747,12 @@ def process_tasks(conn, tasks_list, session_id=None):
             if title:
                 sets.append("title = ?")
                 params.append(title)
+            due = _parse_due(task, action, session_id)
+            if due is None:
+                continue
+            if due:
+                sets.append("due = ?")
+                params.append(due)
 
             if sets:
                 sets.append("updated = datetime('now')")
@@ -746,6 +774,10 @@ def process_tasks(conn, tasks_list, session_id=None):
                         "INSERT INTO updates (task_id, content) VALUES (?, ?)",
                         (task_id, content),
                     )
+                    if not sets:
+                        conn.execute(
+                            "UPDATE tasks SET updated = datetime('now') WHERE id = ?", (task_id,)
+                        )
                     updates_inserted += 1
             continue
 
@@ -766,6 +798,9 @@ def process_tasks(conn, tasks_list, session_id=None):
         if not horizon or horizon not in VALID_HORIZON:
             _skip(session_id, action, "invalid horizon", horizon=horizon)
             continue
+        due = _parse_due(task, action, session_id)
+        if due is None:
+            continue
 
         # Dedup: skip if a task with this title exists in ANY status. An open match
         # is a duplicate; a 'dropped' or 'done' match is a tombstone — re-adding it
@@ -782,17 +817,12 @@ def process_tasks(conn, tasks_list, session_id=None):
             _skip(session_id, action, "near_duplicate", task_id=dup["id"], status=dup["status"])
             continue
 
-        if session_id:
-            metadata = json.dumps({"source_session_id": session_id})
-            conn.execute(
-                "INSERT INTO tasks (title, domain, priority, horizon, metadata) VALUES (?, ?, ?, ?, ?)",
-                (title, domain, priority, horizon, metadata),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO tasks (title, domain, priority, horizon) VALUES (?, ?, ?, ?)",
-                (title, domain, priority, horizon),
-            )
+        metadata = json.dumps({"source_session_id": session_id}) if session_id else None
+        conn.execute(
+            "INSERT INTO tasks (title, domain, priority, horizon, metadata, due) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (title, domain, priority, horizon, metadata, due or None),
+        )
         tasks_inserted += 1
 
     return tasks_inserted, updates_inserted, tasks_updated
@@ -1012,10 +1042,14 @@ def extract_chunk(session_id, token, chunk, part, cfg):
     message are written in one transaction, and only while *token* still holds
     the session's lease. Returns True if they were stored.
     """
+    with open_db() as conn:
+        day = conn.execute(
+            "SELECT date(timestamp, 'localtime') FROM messages WHERE id = ?", (chunk[0][0],)
+        ).fetchone()[0]
     try:
         result, _ = asyncio.run(
             call_model(
-                build_extraction_prompt(chunk, session_id, part),
+                build_extraction_prompt(chunk, session_id, part, day),
                 allowed_tools=["Bash"],
                 output_format={"type": "json_schema", "schema": EXTRACTION_SCHEMA},
             )

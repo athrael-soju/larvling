@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 def get_schema_version(conn):
@@ -330,7 +330,8 @@ def create_schema(conn):
             horizon TEXT NOT NULL DEFAULT 'later' CHECK(horizon IN ('now', 'soon', 'later')),
             metadata TEXT,
             created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            due TEXT
         )
     """
     )

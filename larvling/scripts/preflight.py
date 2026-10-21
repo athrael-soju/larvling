@@ -193,6 +193,24 @@ def migrate_v16_to_v17(conn):
     return {"fts5": ensure_fts(conn)}
 
 
+def migrate_v17_to_v18(conn):
+    """v18: tasks.due, and tasks.updated as the last time a task was touched.
+
+    Earlier versions didn't move updated when an update was added, so it is
+    brought up to each task's latest update.
+    """
+    conn.execute("ALTER TABLE tasks ADD COLUMN due TEXT")
+    cur = conn.execute(
+        """
+        UPDATE tasks SET updated = (
+            SELECT MAX(u.timestamp) FROM updates u WHERE u.task_id = tasks.id
+        )
+        WHERE (SELECT MAX(u.timestamp) FROM updates u WHERE u.task_id = tasks.id) > updated
+        """
+    )
+    return {"tasks_touch_backfilled": cur.rowcount}
+
+
 # Schema version -> the step that upgrades it by one. Don't change a step
 # after release; add a new one.
 MIGRATIONS = {
@@ -200,6 +218,7 @@ MIGRATIONS = {
     14: migrate_v14_to_v15,
     15: migrate_v15_to_v16,
     16: migrate_v16_to_v17,
+    17: migrate_v17_to_v18,
 }
 
 

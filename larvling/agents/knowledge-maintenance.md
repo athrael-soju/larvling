@@ -17,7 +17,7 @@ SQLite database at `.claude/larvling.db`.
 - `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 
 **Tasks schema:**
-- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT CHECK IN ('open','done','dropped'), priority TEXT CHECK IN ('low','medium','high'), horizon TEXT CHECK IN ('now','soon','later'), metadata TEXT, created TEXT, updated TEXT)`
+- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT CHECK IN ('open','done','dropped'), priority TEXT CHECK IN ('low','medium','high'), horizon TEXT CHECK IN ('now','soon','later'), metadata TEXT, created TEXT, updated TEXT [last touched], due TEXT [YYYY-MM-DD])`
 - `updates (id INTEGER PK AUTO, task_id INTEGER FK→tasks(id), content TEXT NOT NULL, timestamp TEXT)`
 
 `tasks.metadata` is an optional JSON object (nullable). When present, carries `{"source_session_id": "<sid>"}` for provenance. Query via `json_extract(metadata, '$.source_session_id')`.
@@ -79,14 +79,14 @@ Run the three phases in order. Within each phase, query first, then group findin
 1. **Query** tasks with counts of attached updates and the age since creation/last update:
    ```sql
    SELECT t.id, t.title, t.status, t.priority, t.horizon, t.domain,
-          t.created, COUNT(u.id) AS n_updates, MAX(u.timestamp) AS last_update
+          t.created, t.updated, t.due, COUNT(u.id) AS n_updates, MAX(u.timestamp) AS last_update
    FROM tasks t LEFT JOIN updates u ON u.task_id = t.id
    GROUP BY t.id
    ORDER BY t.status, t.created;
    ```
 2. **Identify issues**:
    - **Duplicate open tasks**: same or near-identical title with `status = 'open'`
-   - **Stale open tasks**: `status = 'open'` with no updates and `created` > 30 days ago (horizon = 'now' cutoff is tighter, e.g. 7 days)
+   - **Stale open tasks**: `status = 'open'` and `updated` (last touched) more than 30 days ago. Session start already moves untouched `now` tasks to `soon` and lists stale `soon` ones as drop candidates; here, decide with the user whether to drop them
    - **Mismatched horizon/priority**: e.g. `priority = 'high'` + `horizon = 'later'`
    - **Invalid domain classification**: wrong domain for the task's subject
    - **Orphan updates**: `updates` rows whose `task_id` no longer exists (indicates a data-integrity issue — flag, do not silently drop)

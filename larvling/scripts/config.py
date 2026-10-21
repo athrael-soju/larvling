@@ -21,6 +21,12 @@ DEFAULTS = {
     # Word overlap (0-1) at which a new statement or task counts as a
     # reworded duplicate of an existing one and is skipped.
     "dedup_threshold": 0.8,
+    # Task decay at session start, in days; 0 turns a rule off. An open 'now'
+    # task untouched this long moves to 'soon'; a 'soon' one is listed as a
+    # drop candidate; a task due this soon moves to 'now'.
+    "decay_now_days": 7,
+    "decay_soon_days": 30,
+    "due_soon_days": 7,
 }
 
 
