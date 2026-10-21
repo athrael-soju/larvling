@@ -1,6 +1,7 @@
 """Larvling configuration — reads .claude/larvling.config.json with zero-config defaults."""
 
 import json
+import math
 import os
 
 CONFIG_PATH = os.path.join(
@@ -29,6 +30,22 @@ DEFAULTS = {
     "due_soon_days": 7,
 }
 
+# Largest value a numeric setting takes; every one is at least 0.
+MAXIMUMS = {"dedup_threshold": 1}
+
+
+def _number(value, default, maximum=None):
+    """*value* as a number of *default*'s kind, or None if it isn't one: not a
+    finite number from 0 to *maximum* (true/false aren't numbers here), or a
+    fraction where a whole number is expected."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0 or (maximum is not None and value > maximum):
+        return None
+    if isinstance(default, int) and value != int(value):
+        return None
+    return type(default)(value)
+
 
 def get_config():
     """Load config with defaults. Missing keys use defaults. Missing file = all defaults."""
@@ -44,9 +61,9 @@ def get_config():
                 if isinstance(default, bool):
                     config[key] = bool(value)
                 elif isinstance(default, (int, float)):
-                    # A number of the default's kind, not negative; true/false aren't numbers here.
-                    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
-                        config[key] = type(default)(value)
+                    number = _number(value, default, MAXIMUMS.get(key))
+                    if number is not None:
+                        config[key] = number
                 elif isinstance(value, str) and value.strip():
                     config[key] = value.strip()
     except (FileNotFoundError, json.JSONDecodeError, OSError):

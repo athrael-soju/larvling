@@ -84,7 +84,7 @@ def inject_context(conn, session_id):
             f'query: {py} "{query_script}" "<SQL>"\n'
             "When the answer depends on stored knowledge not already in context, "
             "retrieve it and weave it in. Prefer `/recall <term>`; use raw SQL only "
-            "for aggregates/joins it can't do. SQL hits large tables (statements, "
+            "for aggregates/joins it can't do. SQL hits large tables (current_statements, "
             "tasks, messages) — so select only the columns you need (`substr(claim,1,160)` "
             "for long text) and let the question itself size the result: filter narrowly, "
             "and add a `LIMIT` only when the answer would otherwise be excessive, not by "
