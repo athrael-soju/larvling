@@ -1,16 +1,22 @@
 """
 Larvling Preflight — schema bootstrap.
 Ensures the database and schema exist before any other hooks run.
+Upgrades listed in MIGRATIONS run automatically; any other version change
+prints both schemas for the agent to migrate.
 """
 
+import bisect
 import os
-import shutil
+import sqlite3
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 
 from db import (
     DB_PATH,
     SCHEMA_VERSION,
     open_db,
+    log,
     reconfigure_stdout,
     create_schema,
     get_schema_version,
@@ -20,13 +26,197 @@ from db import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Code-driven migrations
+# ---------------------------------------------------------------------------
+
+# analyze.py writes its "Extraction:" message in the same transaction as its
+# statements, so both get the same timestamp.
+_MARKER_WINDOW = timedelta(seconds=5)
+# How long a turn can run when a statement is written during it (/remember).
+_TURN_WINDOW = timedelta(minutes=10)
+
+
+def _parse_ts(value):
+    """Parse a stored timestamp as naive UTC, the way SQLite writes them."""
+    try:
+        ts = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
+
+
+def _load_messages(conn, where):
+    """Return [(timestamp, session_id, role)] for matching messages, oldest first.
+
+    Messages whose session row is missing are left out.
+    """
+    rows = []
+    for r in conn.execute(
+        "SELECT m.id, m.session_id, m.role, m.timestamp FROM messages m "
+        f"JOIN sessions s ON s.id = m.session_id WHERE {where}"
+    ):
+        ts = _parse_ts(r["timestamp"])
+        if ts:
+            rows.append((ts, r["id"], r["session_id"], r["role"]))
+    rows.sort()
+    return [(ts, sid, role) for ts, _, sid, role in rows]
+
+
+def _sole(values):
+    """Return the only distinct value in *values*, or None if there isn't exactly one."""
+    distinct = set(values)
+    return distinct.pop() if len(distinct) == 1 else None
+
+
+def backfill_statement_sessions(conn):
+    """Fill in session_id on old statements from the message log.
+
+    A statement gets the session of, in order:
+    1. an "Extraction:" message that wrote statements, within _MARKER_WINDOW
+       of its `created` time, or
+    2. if there is no such message, an unanswered user message in the
+       _TURN_WINDOW before it.
+    If no session or more than one matches, session_id stays NULL.
+    Returns the number of statements updated.
+    """
+    markers = _load_messages(
+        conn, "m.role = 'system' AND m.content LIKE 'Extraction:%statements%'"
+    )
+    marker_times = [m[0] for m in markers]
+    turns = _load_messages(conn, "m.role IN ('user', 'assistant')")
+    turn_times = [t[0] for t in turns]
+
+    attributed = 0
+    for row in conn.execute(
+        "SELECT id, created FROM statements WHERE session_id IS NULL"
+    ).fetchall():
+        created = _parse_ts(row["created"])
+        if created is None:
+            continue
+
+        lo = bisect.bisect_left(marker_times, created - _MARKER_WINDOW)
+        hi = bisect.bisect_right(marker_times, created + _MARKER_WINDOW)
+        nearby = markers[lo:hi]
+        sid = _sole(m[1] for m in nearby)
+
+        if not nearby:
+            lo = bisect.bisect_left(turn_times, created - _TURN_WINDOW)
+            hi = bisect.bisect_right(turn_times, created)
+            last_role = {}
+            for _, s, role in turns[lo:hi]:
+                last_role[s] = role
+            sid = _sole(s for s, role in last_role.items() if role == "user")
+
+        if sid:
+            conn.execute(
+                "UPDATE statements SET session_id = ? WHERE id = ?", (sid, row["id"])
+            )
+            attributed += 1
+    return attributed
+
+
+def migrate_v13_to_v14(conn):
+    """v14: add source, kind and session_id to statements.
+
+    Existing rows keep NULL source and kind; session_id is filled in where possible.
+    """
+    conn.execute(
+        "ALTER TABLE statements ADD COLUMN "
+        "source TEXT CHECK(source IN ('user', 'agent', 'doc', 'manual'))"
+    )
+    conn.execute(
+        "ALTER TABLE statements ADD COLUMN "
+        "kind TEXT CHECK(kind IN ('fact', 'decision', 'preference', 'assessment'))"
+    )
+    conn.execute(
+        "ALTER TABLE statements ADD COLUMN session_id TEXT REFERENCES sessions(id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_session ON statements(session_id)"
+    )
+    return {"statements_attributed": backfill_statement_sessions(conn)}
+
+
+# Schema version -> the step that upgrades it by one. Don't change a step
+# after release; add a new one.
+MIGRATIONS = {
+    13: migrate_v13_to_v14,
+}
+
+
+def run_migrations(conn, from_version):
+    """Run the steps from *from_version* to SCHEMA_VERSION and commit.
+
+    The caller holds the write lock (BEGIN IMMEDIATE). Returns the steps'
+    stats, or None if a step is missing or fails; the transaction is then
+    rolled back and the DB left unchanged.
+    """
+    versions = range(from_version, SCHEMA_VERSION)
+    if not versions or any(v not in MIGRATIONS for v in versions):
+        conn.rollback()
+        return None
+    try:
+        stats = {}
+        for v in versions:
+            stats.update(MIGRATIONS[v](conn) or {})
+        set_schema_version(conn)
+        conn.commit()
+        return stats
+    except Exception as e:
+        conn.rollback()
+        log("schema_migration_error", from_version=from_version, error=str(e))
+        return None
+
+
+def _reserve_backup_path(db_version):
+    """Create an empty backup file under a name no earlier backup uses.
+
+    Tries larvling.db.v<N>.bak, then .v<N>.<stamp>.bak, .v<N>.<stamp>-2.bak, ...
+    O_EXCL makes taking a name atomic, so two sessions never share one.
+    """
+    base = DB_PATH + f".v{db_version}"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    names = [f"{base}.bak", f"{base}.{stamp}.bak"]
+    names += [f"{base}.{stamp}-{n}.bak" for n in range(2, 1000)]
+    for path in names:
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        return path
+    raise RuntimeError(f"no free backup name for {base}")
+
+
+def backup_db(db_version):
+    """Copy the DB before a migration, without overwriting an older backup.
+
+    Uses its own connection: the caller holds the write lock, so the copy is
+    the committed DB as it is before migrating. The backup API includes recent
+    writes that a plain file copy can miss. Returns the backup path.
+    """
+    path = _reserve_backup_path(db_version)
+    src = sqlite3.connect(DB_PATH)
+    dest = sqlite3.connect(path)
+    try:
+        src.backup(dest)
+    finally:
+        dest.close()
+        src.close()
+    return path
+
+
 def ensure_schema():
     """Ensure current schema exists.
 
     Returns:
         'fresh'    - first install, schema created
         'current'  - schema up to date
-        'migrate'  - version mismatch, migration context printed for Claude
+        'migrated' - upgraded automatically (see MIGRATIONS)
+        'migrate'  - no automatic upgrade, migration context printed for Claude
+        'busy'     - another session held the DB too long; try at the next start
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -44,12 +234,37 @@ def ensure_schema():
         if db_version == SCHEMA_VERSION:
             return "current"
 
-        # Version mismatch - backup DB, then dump both schemas for Claude to handle
+        # Hold the write lock from the backup to the end of the migration, so
+        # no other session migrates in between.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            log("schema_migration_busy", from_version=db_version, error=str(e))
+            return "busy"
+        db_version = get_schema_version(conn)
+        if db_version == SCHEMA_VERSION:  # another session migrated first
+            conn.rollback()
+            return "current"
+
+        try:
+            backup_path = backup_db(db_version)
+        except Exception:
+            conn.rollback()
+            raise
+        stats = run_migrations(conn, db_version)
+        if stats is not None:
+            log(
+                "schema_migrated",
+                from_version=db_version,
+                to_version=SCHEMA_VERSION,
+                backup=backup_path,
+                **stats,
+            )
+            return "migrated"
+
+        # No automatic upgrade - dump both schemas for Claude to handle
         old_schema = get_current_schema(conn)
         new_schema = get_desired_schema()
-
-    backup_path = DB_PATH + f".v{db_version}.bak"
-    shutil.copy2(DB_PATH, backup_path)
 
     print("# Larvling - Schema Migration Required\n")
     print(
