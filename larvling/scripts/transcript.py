@@ -107,7 +107,13 @@ def _mid_turn_words(entry, tool_names):
         if not isinstance(block, dict) or block.get("type") != "tool_result":
             continue
         result = _block_text(block.get("content"))
-        if result.startswith(_REJECTION) and _REJECTION_FEEDBACK in result:
+        # Claude Code marks a real rejection as an error and records it as
+        # rejected; tool output that only quotes the wording is neither.
+        rejected = (
+            block.get("is_error") is True
+            and str(entry.get("toolUseResult", "")).startswith("User rejected")
+        )
+        if rejected and result.startswith(_REJECTION) and _REJECTION_FEEDBACK in result:
             feedback = result.split(_REJECTION_FEEDBACK, 1)[1].strip()
             if feedback:
                 words.append(feedback)
