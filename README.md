@@ -139,6 +139,7 @@ python -m unittest discover -s tests
 | `larvling/scripts/summarize.py`           | Fetches conversation pairs and stores session summaries    |
 | `larvling/scripts/export.py`              | Exports a session conversation to markdown                 |
 | `larvling/scripts/query.py`               | Runs arbitrary SQL against larvling.db                     |
+| `larvling/scripts/search.py`              | Ranked full-text search over knowledge and tasks           |
 | `larvling/skills/*.md`                    | Skill definitions (remember, recall, forget, etc.)         |
 | `larvling/CLAUDE.md`                      | Instructions for the agent                                 |
 

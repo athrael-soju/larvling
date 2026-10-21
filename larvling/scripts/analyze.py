@@ -27,6 +27,7 @@ from db import (
 )
 from hooks_util import run_detached_or_inline
 from sdk import call_model
+from search import duplicate_statement, duplicate_task, duplicate_topic
 from transcript import agent_prompts
 
 
@@ -95,6 +96,12 @@ Query the database to check for existing data before deciding actions:
 
 {python} "{query_script}" "<SQL>" --read-only
 
+To look for existing knowledge or tasks, search instead of writing LIKE queries. \
+It ranks matches on any of the words, in claims and topic titles:
+
+{python} "{search_script}" "<words>"            (current statements, with their topic)
+{python} "{search_script}" "<words>" --tasks    (tasks in every status)
+
 Six tables in 3 parent→child pairs:
 - `topics` (id INTEGER PK, title, domain, tags, created, updated)
 - `statements` (id INTEGER PK, topic_id INTEGER FK→topics(id), claim, created, updated, source, kind, session_id, superseded_by, superseded_at)
@@ -142,16 +149,16 @@ work leaves the open list instead of lingering until the next tidy.
 
 ### Phase 2 — Dedup check (mandatory)
 
-For EACH knowledge candidate, run at least one query against topics and \
-current_statements to check for overlap. Use LIKE queries on title and claim columns.
+For EACH knowledge candidate, search for overlap with its key words \
+(`search.py "<words>"`). Try other wordings too: a match may use different words.
 
-For EACH task candidate, run at least one query against tasks and their updates \
-to check for overlap — and query ALL statuses, not just open ones \
-(e.g. `SELECT id, title, status FROM tasks WHERE title LIKE '%...%'`). A task with \
+For EACH task candidate, search tasks for overlap (`search.py "<words>" --tasks`, \
+which covers ALL statuses, not just open ones) and query the updates of any match. A task with \
 `status='dropped'` was deliberately retired, and one with `status='done'` is already \
 complete: treat both as tombstones. If a candidate resembles a dropped or done task, \
 `skip` it — never recreate or reopen retired work unless the user explicitly asked for \
-it again in this conversation.
+it again in this conversation, and then reopen it with `update_task` (`status: open`) \
+rather than adding it again.
 
 For session tags, query the current session's tags:
 `SELECT tags FROM sessions WHERE id = '{session_id}'`
@@ -328,8 +335,11 @@ def build_extraction_prompt(messages, session_id="", part=None):
         )
     else:
         scope = "It is a whole session, or the part of it not yet extracted."
-    query_script = os.path.join(os.path.dirname(__file__), "query.py")
+    scripts = os.path.dirname(__file__)
+    query_script = os.path.join(scripts, "query.py")
+    search_script = os.path.join(scripts, "search.py")
     return EXTRACTION_PROMPT.format(
+        search_script=search_script.replace("\\", "/"),
         scope=scope,
         transcript=format_transcript(messages),
         session_id=session_id or "",
@@ -475,6 +485,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
         return 0, 0, 0, 0
     user_texts = _as_list(user_texts)
     agent_texts = _as_list(agent_texts)
+    threshold = get_config()["dedup_threshold"]
 
     topics_inserted = 0
     stmts_inserted = 0
@@ -586,6 +597,10 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 (topic_id, claim),
             ).fetchone():
                 continue
+            dup = duplicate_statement(conn, claim, threshold, topic_id)
+            if dup:
+                _skip(session_id, action, "near_duplicate", statement_id=dup["id"])
+                continue
             conn.execute(
                 "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -620,18 +635,27 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
             "SELECT 1 FROM current_statements WHERE claim = ?", (claim,)
         ).fetchone():
             continue
+        dup = duplicate_statement(conn, claim, threshold)
+        if dup:
+            _skip(session_id, action, "near_duplicate", statement_id=dup["id"])
+            continue
 
-        cur = conn.execute(
-            "INSERT INTO topics (title, domain, tags) VALUES (?, ?, ?)",
-            (topic_title, domain, tags),
-        )
-        topic_id = cur.lastrowid
+        # A reworded title of an existing topic: the statement goes there.
+        same_topic = duplicate_topic(conn, topic_title, threshold)
+        if same_topic:
+            log("topic_reused", session_id, topic_id=same_topic["id"], title=topic_title[:80])
+            topic_id = same_topic["id"]
+        else:
+            topic_id = conn.execute(
+                "INSERT INTO topics (title, domain, tags) VALUES (?, ?, ?)",
+                (topic_title, domain, tags),
+            ).lastrowid
+            topics_inserted += 1
         conn.execute(
             "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
             "VALUES (?, ?, ?, ?, ?)",
             (topic_id, claim, *provenance, session_id),
         )
-        topics_inserted += 1
         stmts_inserted += 1
 
     return topics_inserted, stmts_inserted, stmts_superseded, topics_updated
@@ -649,6 +673,7 @@ def process_tasks(conn, tasks_list, session_id=None):
     tasks_inserted = 0
     updates_inserted = 0
     tasks_updated = 0
+    threshold = get_config()["dedup_threshold"]
 
     for task in tasks_list:
         action = _field(task, "action").lower()
@@ -770,6 +795,11 @@ def process_tasks(conn, tasks_list, session_id=None):
             "SELECT 1 FROM tasks WHERE title = ? AND status IN ('open', 'dropped', 'done')",
             (title,),
         ).fetchone():
+            continue
+        # Same for a reworded title.
+        dup = duplicate_task(conn, title, threshold)
+        if dup:
+            _skip(session_id, action, "near_duplicate", task_id=dup["id"], status=dup["status"])
             continue
 
         if session_id:

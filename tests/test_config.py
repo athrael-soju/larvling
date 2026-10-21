@@ -37,6 +37,14 @@ class ConfigTest(unittest.TestCase):
                 write_config({"model": value})
                 self.assertEqual(config.get_config()["model"], "sonnet")
 
+    def test_numbers_must_be_non_negative_numbers(self):
+        write_config({"dedup_threshold": 0.6})
+        self.assertEqual(config.get_config()["dedup_threshold"], 0.6)
+        for value in (-1, "0.5", True, None, [0.5]):
+            with self.subTest(value=value):
+                write_config({"dedup_threshold": value})
+                self.assertEqual(config.get_config()["dedup_threshold"], 0.8)
+
     def test_switches_are_still_coerced_to_booleans(self):
         write_config({"analysis": 0, "geolocation": 1})
         cfg = config.get_config()

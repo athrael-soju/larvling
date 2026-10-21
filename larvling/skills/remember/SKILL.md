@@ -29,9 +29,9 @@ Classify knowledge into one of: `personal`, `professional`, `preferences`, `inte
 
 ## Steps
 
-1. **Search for overlap** — query existing topics and statements to check for semantic duplicates:
+1. **Search for overlap** — search existing knowledge for the key words of what to remember, and try a rewording too:
    ```
-   $PY "${CLAUDE_PLUGIN_ROOT}/scripts/query.py" "SELECT t.id, t.title, t.domain, t.tags, s.id AS stmt_id, s.claim FROM topics t JOIN current_statements s ON s.topic_id = t.id" --json
+   $PY "${CLAUDE_PLUGIN_ROOT}/scripts/search.py" "<key words>" --assessments
    ```
 2. **Decide** the right action:
    - **New topic + statement** — knowledge is genuinely new, no existing topic covers it

@@ -1,6 +1,7 @@
 """Larvling configuration — reads .claude/larvling.config.json with zero-config defaults."""
 
 import json
+import math
 import os
 
 CONFIG_PATH = os.path.join(
@@ -18,7 +19,26 @@ DEFAULTS = {
     "session_tags": True,
     "geolocation": False,
     "model": "sonnet",
+    # Word overlap (0-1) at which a new statement or task counts as a
+    # reworded duplicate of an existing one and is skipped.
+    "dedup_threshold": 0.8,
 }
+
+# Largest value a numeric setting takes; every one is at least 0.
+MAXIMUMS = {"dedup_threshold": 1}
+
+
+def _number(value, default, maximum=None):
+    """*value* as a number of *default*'s kind, or None if it isn't one: not a
+    finite number from 0 to *maximum* (true/false aren't numbers here), or a
+    fraction where a whole number is expected."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0 or (maximum is not None and value > maximum):
+        return None
+    if isinstance(default, int) and value != int(value):
+        return None
+    return type(default)(value)
 
 
 def get_config():
@@ -31,10 +51,15 @@ def get_config():
             for key, default in DEFAULTS.items():
                 if key not in user:
                     continue
+                value = user[key]
                 if isinstance(default, bool):
-                    config[key] = bool(user[key])
-                elif isinstance(user[key], str) and user[key].strip():
-                    config[key] = user[key].strip()
+                    config[key] = bool(value)
+                elif isinstance(default, (int, float)):
+                    number = _number(value, default, MAXIMUMS.get(key))
+                    if number is not None:
+                        config[key] = number
+                elif isinstance(value, str) and value.strip():
+                    config[key] = value.strip()
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return config
