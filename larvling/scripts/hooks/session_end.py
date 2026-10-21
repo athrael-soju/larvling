@@ -34,7 +34,8 @@ def handle(data):
         # they don't start an exchange.
         exchange_count = conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user' "
-            "AND COALESCE(json_valid(metadata) AND json_extract(metadata, '$.mid_turn'), 0) = 0",
+            "AND NOT COALESCE(CASE WHEN json_valid(metadata) "
+            "THEN json_extract(metadata, '$.mid_turn') END, 0)",
             (session_id,),
         ).fetchone()[0]
 

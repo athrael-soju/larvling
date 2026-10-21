@@ -18,7 +18,7 @@ import support
 import analyze
 import db
 import preflight
-from test_provenance import make_v13_db, run_preflight
+from test_provenance import MARKER, make_v13_db, run_preflight
 
 sys.path.insert(0, os.path.join(support.SCRIPTS_DIR, "hooks"))
 import prompt  # noqa: E402
@@ -93,6 +93,17 @@ def record(session_id, exchanges, minutes_ago=None):
 def extract(model, data=None):
     with mock.patch.object(analyze, "call_model", model):
         analyze._run(data or {"session_id": SID, "hook_event_name": "SessionEnd"})
+
+
+PRECOMPACT = {"session_id": SID, "hook_event_name": "PreCompact"}
+
+
+def write_transcript(name, entries):
+    path = os.path.join(support.PROJECT_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    return path
 
 
 def session_row(session_id=SID):
@@ -208,11 +219,32 @@ class SessionExtractionTest(unittest.TestCase):
         with db.open_db() as conn:
             conn.execute("UPDATE sessions SET extract_lease = datetime('now') WHERE id = ?", (SID,))
         model = FakeModel()
-        extract(model)
+        extract(model, PRECOMPACT)
         self.assertEqual(model.prompts, [])
         self.assertEqual(
             support.logged("extraction_skipped")[0]["reason"], "session already being extracted"
         )
+
+    def test_session_end_waits_for_a_running_worker_then_extracts(self):
+        with db.open_db() as conn:
+            conn.execute("UPDATE sessions SET extract_lease = datetime('now') WHERE id = ?", (SID,))
+        waits = []
+
+        def running_worker_finishes(seconds):
+            waits.append(seconds)
+            with db.open_db() as conn:
+                conn.execute("UPDATE sessions SET extract_lease = NULL WHERE id = ?", (SID,))
+
+        model = FakeModel()
+        with mock.patch.object(analyze.time, "sleep", running_worker_finishes):
+            extract(model)
+        self.assertEqual(waits, [analyze.CLAIM_POLL_SECONDS])
+        self.assertEqual(len(model.prompts), 1)
+        self.assertEqual(session_row()["extracted_through"], last_message_id())
+
+    def test_a_session_with_no_row_is_not_reported_as_busy(self):
+        extract(FakeModel(), {"session_id": "ghost", "hook_event_name": "SessionEnd"})
+        self.assertEqual(support.logged("extraction_skipped"), [])
 
     def test_an_expired_lease_is_taken_over(self):
         with db.open_db() as conn:
@@ -250,6 +282,83 @@ class SessionExtractionTest(unittest.TestCase):
         model = FakeModel()
         extract(model)
         self.assertEqual(model.prompts, [])
+        # What was recorded while it was off isn't extracted once it's back on.
+        self.assertEqual(session_row()["extracted_through"], last_message_id())
+        os.remove(os.path.join(support.CLAUDE_DIR, "larvling.config.json"))
+        extract(model)
+        self.assertEqual(model.prompts, [])
+
+
+class PreCompactTest(unittest.TestCase):
+    """PreCompact fires mid-turn, while the session keeps going."""
+
+    def setUp(self):
+        fresh_db()
+        record(SID, EXCHANGES[:2])
+        with db.open_db() as conn:
+            db.record_message(conn, SID, "user", "Now write the DAG for me.")
+
+    def test_the_prompt_being_answered_waits_for_its_answer(self):
+        model = FakeModel()
+        extract(model, PRECOMPACT)
+        self.assertEqual(len(model.prompts), 1)
+        self.assertNotIn("write the DAG", model.prompts[0])
+        self.assertIn(EXCHANGES[1][1], model.prompts[0])
+
+        with db.open_db() as conn:
+            db.record_message(conn, SID, "assistant", "Here is the DAG.")
+        model = FakeModel()
+        extract(model)
+        self.assertEqual(len(model.prompts), 1)
+        self.assertIn("[1] USER: Now write the DAG for me.", model.prompts[0])
+        self.assertIn("[2] AGENT: Here is the DAG.", model.prompts[0])
+        self.assertEqual(session_row()["extracted_through"], last_message_id())
+
+    def test_one_pass_over_what_was_pending_when_it_started(self):
+        def session_goes_on():
+            with db.open_db() as conn:
+                db.record_message(conn, SID, "assistant", "Here is the DAG.")
+                db.record_message(conn, SID, "user", "Thanks!")
+                db.record_message(conn, SID, "assistant", "You're welcome.")
+
+        model = FakeModel(during=session_goes_on)
+        extract(model, PRECOMPACT)
+        self.assertEqual(len(model.prompts), 1)
+        self.assertLess(session_row()["extracted_through"], last_message_id())
+
+    def test_a_prompt_claude_code_wrote_is_relabelled_before_extraction(self):
+        # A message from another session started a turn; Stop hasn't run yet.
+        text = "Message from session B: the deploy finished."
+        with db.open_db() as conn:
+            db.record_message(conn, SID, "assistant", "Here is the DAG.")
+            db.record_message(conn, SID, "user", text)
+            db.record_message(conn, SID, "user", "And I'm the only one on call.", {"mid_turn": True})
+            db.record_message(conn, SID, "assistant", "Noted.")
+        path = write_transcript("precompact.jsonl", [
+            {"type": "user", "message": {"role": "user", "content": EXCHANGES[0][0]}},
+            {"type": "user", "isMeta": True, "promptSource": "system",
+             "message": {"role": "user", "content": text}},
+        ])
+        model = FakeModel({"knowledge": [fact("Deploy finished", "the deploy finished")]})
+        extract(model, {**PRECOMPACT, "transcript_path": path})
+        self.assertNotIn(f"USER: {text}", model.prompts[0])
+        self.assertIn("USER: And I'm the only one on call.", model.prompts[0])
+        self.assertEqual(claims(), [])
+        with db.open_db() as conn:
+            self.assertEqual(conn.execute(
+                "SELECT role FROM messages WHERE content = ?", (text,)).fetchone()[0], "system")
+            # The user's own prompt is untouched.
+            self.assertEqual(conn.execute(
+                "SELECT role FROM messages WHERE content = ?", (EXCHANGES[0][0],)).fetchone()[0],
+                "user")
+
+
+class ChunkTest(unittest.TestCase):
+    def test_a_prompt_and_what_the_user_added_stay_with_the_answer(self):
+        messages = [(1, "user", "a" * 10), (2, "assistant", "b" * 10),
+                    (3, "user", "c" * 10), (4, "user", "d" * 10), (5, "assistant", "e" * 10)]
+        chunks = analyze.chunk_messages(messages, budget=45)
+        self.assertEqual([[m[0] for m in c] for c in chunks], [[1, 2], [3, 4, 5]])
 
 
 class CatchUpTest(unittest.TestCase):
@@ -271,6 +380,23 @@ class CatchUpTest(unittest.TestCase):
         self.assertIsNone(session_row(SID)["extracted_through"])
         self.assertIsNone(session_row("sess-live")["extracted_through"])
 
+    def test_a_session_whose_transcript_is_still_being_written_is_left_alone(self):
+        # Quiet in the DB, but in the middle of a long agent turn.
+        transcripts = os.path.join(support.PROJECT_DIR, "transcripts")
+        os.makedirs(transcripts, exist_ok=True)
+        other = os.path.join(transcripts, f"{OTHER}.jsonl")
+        with open(other, "w") as f:
+            f.write("{}\n")
+        data = {"catch_up": True, "session_id": SID,
+                "transcript_path": os.path.join(transcripts, f"{SID}.jsonl")}
+        model = FakeModel()
+        extract(model, data)
+        self.assertEqual(model.prompts, [])
+        quiet = os.path.getmtime(other) - 3600
+        os.utime(other, (quiet, quiet))
+        extract(model, data)
+        self.assertEqual(len(model.prompts), 1)
+
     def test_session_start_spawns_a_worker_only_when_needed(self):
         with mock.patch.object(session_start, "spawn_with_payload") as spawn:
             session_start.start_catch_up(SID)
@@ -286,6 +412,33 @@ class CatchUpTest(unittest.TestCase):
 
 
 class MigrationTest(unittest.TestCase):
+    def test_a_migration_by_hand_is_told_to_count_earlier_messages_as_extracted(self):
+        support.reset_db()
+        make_v13_db()
+        with mock.patch.dict(preflight.MIGRATIONS, clear=True):
+            result, out = run_preflight()
+        self.assertEqual(result, "migrate")
+        self.assertIn(preflight.MARK_EXTRACTED, out)
+
+    def test_a_worker_on_a_db_its_session_couldnt_migrate_migrates_it(self):
+        # The session started while another held the DB, so it is still at
+        # v13; what it recorded after the old code's last extraction is new.
+        support.reset_db()
+        make_v13_db(messages=[
+            ("sess-a", "2026-05-01 10:00:00", "user", "I live in Lisbon"),
+            ("sess-a", "2026-05-01 10:01:00", "assistant", "Noted."),
+            ("sess-a", "2026-05-01 10:03:00", "system", MARKER),
+            ("sess-a", "2026-05-01 10:05:00", "user", "I work at a bank."),
+            ("sess-a", "2026-05-01 10:06:00", "assistant", "Noted too."),
+        ])
+        model = FakeModel()
+        extract(model, {"session_id": "sess-a", "hook_event_name": "SessionEnd"})
+        with db.open_db() as conn:
+            self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
+        self.assertEqual(len(model.prompts), 1)
+        self.assertIn("[1] USER: I work at a bank.", model.prompts[0])
+        self.assertNotIn("Lisbon", model.prompts[0])
+
     def test_an_upgraded_db_counts_earlier_messages_as_extracted(self):
         support.reset_db()
         make_v13_db()
@@ -395,6 +548,34 @@ class MidTurnRecordingTest(unittest.TestCase):
         stop.handle({"session_id": SID, "transcript_path": self.path})
         self.assertEqual(self.messages(), [
             ("user", self.PROMPT), ("user", self.QUEUED), ("assistant", "Done.")])
+
+    def test_the_same_reply_to_a_new_prompt_is_a_new_turn(self):
+        stop.handle({"session_id": SID, "transcript_path": self.path})
+        with contextlib.redirect_stdout(io.StringIO()):
+            prompt.handle({"session_id": SID, "prompt": "And for the docs repo?"})
+        later = os.path.join(support.PROJECT_DIR, "midturn2.jsonl")
+        with open(later, "w", encoding="utf-8") as f:
+            for e in [
+                {"type": "user", "message": {"role": "user", "content": "And for the docs repo?"}},
+                {"type": "attachment", "attachment": {
+                    "type": "queued_command", "prompt": "It uses GitHub Actions.",
+                    "origin": {"kind": "human"}}},
+                {"type": "assistant", "message": {
+                    "role": "assistant", "content": [{"type": "text", "text": "Done."}]}},
+            ]:
+                f.write(json.dumps(e) + "\n")
+        stop.handle({"session_id": SID, "transcript_path": later})
+        self.assertEqual(self.messages()[3:], [
+            ("user", "And for the docs repo?"), ("user", "It uses GitHub Actions."),
+            ("assistant", "Done.")])
+
+    def test_invalid_metadata_does_not_break_session_end(self):
+        stop.handle({"session_id": SID, "transcript_path": self.path})
+        with db.open_db() as conn:
+            conn.execute("UPDATE messages SET metadata = 'not json' WHERE role = 'user'")
+        session_end.handle({"session_id": SID})
+        self.assertEqual(session_row()["exchange_count"], 2)
+        self.assertIsNotNone(session_row()["ended_at"])
 
     def test_mid_turn_words_reach_extraction_but_are_not_exchanges(self):
         stop.handle({"session_id": SID, "transcript_path": self.path})

@@ -46,6 +46,28 @@ def is_real_user_message(entry):
     )
 
 
+def agent_prompts(transcript_path):
+    """Return the texts of the prompts in the transcript that Claude Code or an
+    agent wrote (see is_real_user_message), leaving out any text the user also
+    sent as a prompt of their own."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return set()
+    agent, user = set(), set()
+    for line in _read_transcript_lines(transcript_path):
+        if '"user"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict) or not starts_turn(entry):
+            continue
+        text = _message_text(entry).strip()
+        if text:
+            (user if is_real_user_message(entry) else agent).add(text)
+    return agent - user
+
+
 def _message_text(entry):
     """Return the text of a user entry, leaving out tool results."""
     content = entry.get("message", {}).get("content", "")
