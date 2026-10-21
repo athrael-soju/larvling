@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 **Schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT)`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
 
 Find the knowledge to remove — by ID, keyword, or by asking the user to clarify. Show matching item(s) and use AskUserQuestion to confirm before deleting. When deleting the last statement under a topic, delete the topic too.
 

@@ -36,7 +36,7 @@ Keep the greeting brief (one sentence acknowledging the context), then present t
 
 ### Schema Migration
 
-When the SessionStart context contains "Schema Migration Required", the database schema needs updating.
+Most upgrades are applied automatically by `preflight.py` before the session starts. When the SessionStart context contains "Schema Migration Required", no automatic path existed (or it failed), and the database schema needs updating by hand.
 Read the current and desired schemas provided, write and run the SQL to migrate (preserving all data), then bump the version in `larvling/db.py` with the provided command.
 A backup of the database has already been created.
 
@@ -69,7 +69,7 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 - `sessions (id TEXT PK, started_at TEXT, ended_at TEXT, duration_min REAL, title TEXT, agent_summary TEXT, exchange_count INT, summary_at TEXT, summary_msg_count INT, tags TEXT, summary_offered INT DEFAULT 0)`
 - `messages (id INT PK AUTO, session_id TEXT FK, timestamp TEXT, role TEXT [user|assistant|system], content TEXT, metadata TEXT)`
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT)`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
 - `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'medium', horizon TEXT DEFAULT 'later', metadata TEXT, created TEXT, updated TEXT)`
 - `updates (id INTEGER PK AUTO, task_id INTEGER FK→tasks(id), content TEXT NOT NULL, timestamp TEXT)`
 
@@ -103,7 +103,7 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 | Table | Key columns |
 |-------|-------------|
 | topics | id, title, domain, tags |
-| statements | id, topic_id, claim |
+| statements | id, topic_id, claim, source, kind, session_id |
 | tasks | id, title, status, priority, horizon, metadata |
 | sessions | id, started_at, title, agent_summary |
 | messages | id, session_id, role, content |
@@ -116,7 +116,7 @@ Larvling stores persistent knowledge in the `topics` + `statements` tables, and 
 **UserPromptSubmit → Knowledge Context (read):** The `## Knowledge Context` directive prints on every exchange with the `query.py` path and topic/statement counts. When the question depends on stored knowledge, recall it and weave it in — but keep reads bounded: prefer the `/recall <term>` skill, or a keyword-filtered query (`claim`/`title`/`tags LIKE`) sized to the question — add a `LIMIT` only if the keyword is broad enough to match a lot. Don't run an unfiltered `SELECT ... FROM statements`, pull whole topics/domains, or dump the table to a file; narrow the keyword instead of widening the pull. When there's a `Last learned:` line, the previous exchange produced new knowledge — mention it naturally if relevant to the conversation.
 
 **Stop → Unified analysis (write):** `analyze.py` runs as a command hook after every response, calling `sdk.py` (`call_model()`) for Agent SDK integration. The extraction agent has Bash tool access to query all 6 tables for dedup — given the full schema, it decides what queries to run. A single SDK call extracts multiple data types from the last exchange:
-- **Knowledge** → `topics` + `statements` tables (hierarchical: topic groups related statements). Actions: `add_topic`, `add_statement`, `update_statement`, `update_topic`.
+- **Knowledge** → `topics` + `statements` tables (hierarchical: topic groups related statements). Actions: `add_topic`, `add_statement`, `update_statement`, `update_topic`. Every statement records its provenance: `source` (`user` or `agent` for extraction, `manual` for `/remember`), `kind` (`fact`, `decision`, `preference`, `assessment`) and the `session_id` that produced it. Statements stored before provenance existed have NULL `source`/`kind`, and a `session_id` only where it could be recovered from the message log.
 - **Session tags** → `sessions.tags` column, comma-separated, dynamically consolidated each exchange. The agent queries current tags itself.
 - **Tasks** → `tasks` + `updates` tables. Actions: `add_task`, `add_update` (attach context/notes), `update_task` (modify status/priority/horizon with reason). Invalid fields skip the item and log to JSONL — no silent coercion.
 

@@ -40,6 +40,10 @@ VALID_DOMAINS = {
 VALID_PRIORITY = {"low", "medium", "high"}
 VALID_HORIZON = {"now", "soon", "later"}
 VALID_STATUS = {"open", "done", "dropped"}
+# Extraction only sees the two speakers; 'doc' and 'manual' sources are
+# written outside extraction (e.g. /remember writes 'manual').
+VALID_SOURCE = {"user", "agent"}
+VALID_KIND = {"fact", "decision", "preference", "assessment"}
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +65,7 @@ Query the database to check for existing data before deciding actions:
 
 Six tables in 3 parent→child pairs:
 - `topics` (id INTEGER PK, title, domain, tags, created, updated)
-- `statements` (id INTEGER PK, topic_id INTEGER FK→topics(id), claim, created, updated)
+- `statements` (id INTEGER PK, topic_id INTEGER FK→topics(id), claim, created, updated, source, kind, session_id)
 - `tasks` (id INTEGER PK, title, domain, status, priority, horizon, metadata, created)
 - `updates` (id INTEGER PK, task_id INTEGER FK→tasks(id), content, timestamp)
 - `sessions` (id TEXT PK, started_at, ended_at, duration_min, title, agent_summary, exchange_count, summary_at, summary_msg_count, tags)
@@ -133,9 +137,13 @@ new tags from this exchange.
 
 ## Output schema
 
-Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
 - Domains: personal, professional, preferences, interests, knowledge, technical, workflow
 - Tags: short topic label (e.g. "octopuses", "physics", "python")
+- source: who said it in this exchange: "user" (the USER's message) or "agent" (the AGENT's response)
+- kind: "fact" (something true about the world, the user or their work), "decision" \
+(a choice the user has made), "preference" (how the user likes things done), \
+"assessment" (a judgement, recommendation or guess rather than an established fact)
 
 Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high", "horizon": "now|soon|later", "status": "open|done|dropped", "action": "add_task|add_update|update_task", "task_id": N, "content": "..."}}
 - "content" is used for add_update (the fact/note) and update_task (the reason for the change)
@@ -146,7 +154,7 @@ Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high"
 
 Return JSON:
 {{
-  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "action": "add_topic"}}],
+  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user", "kind": "fact", "action": "add_topic"}}],
   "session_tags": ["python", "deployment"],
   "tasks": [{{"title": "refactor auth module", "domain": "technical", "priority": "medium", "horizon": "soon", "action": "add_task"}}]
 }}
@@ -166,6 +174,8 @@ EXTRACTION_SCHEMA = {
                     "claim": {"type": "string"},
                     "domain": {"type": "string", "enum": list(VALID_DOMAINS)},
                     "tags": {"type": "string"},
+                    "source": {"type": "string", "enum": list(VALID_SOURCE)},
+                    "kind": {"type": "string", "enum": list(VALID_KIND)},
                     "action": {
                         "type": "string",
                         "enum": [
@@ -178,7 +188,15 @@ EXTRACTION_SCHEMA = {
                     "topic_id": {"type": "integer"},
                     "statement_id": {"type": "integer"},
                 },
-                "required": ["topic_title", "claim", "domain", "tags", "action"],
+                "required": [
+                    "topic_title",
+                    "claim",
+                    "domain",
+                    "tags",
+                    "source",
+                    "kind",
+                    "action",
+                ],
             },
         },
         "session_tags": {"type": "array", "items": {"type": "string"}},
@@ -241,10 +259,25 @@ def _parse_id(value, field_name, action, session_id):
         return None
 
 
+def _parse_provenance(item, action, session_id):
+    """Validate an item's source and kind. Returns (source, kind) or None (with logging)."""
+    source = item.get("source", "").strip().lower()
+    if source not in VALID_SOURCE:
+        _skip(session_id, action, "invalid source", source=source)
+        return None
+    kind = item.get("kind", "").strip().lower()
+    if kind not in VALID_KIND:
+        _skip(session_id, action, "invalid kind", kind=kind)
+        return None
+    return source, kind
+
+
 def process_knowledge(conn, knowledge_list, session_id=None):
     """Process extracted knowledge into topics+statements tables.
 
     Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
+    Every statement written carries its provenance: source, kind and the
+    session that produced it (an updated claim takes the updater's provenance).
     Never deletes data — retirement is done via updates, not removal.
     Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
     """
@@ -300,14 +333,18 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
+            provenance = _parse_provenance(item, action, session_id)
+            if provenance is None:
+                continue
             if not conn.execute(
                 "SELECT 1 FROM statements WHERE id = ?", (stmt_id,)
             ).fetchone():
                 _skip(session_id, action, "statement not found", statement_id=stmt_id)
                 continue
             conn.execute(
-                "UPDATE statements SET claim = ?, updated = datetime('now') WHERE id = ?",
-                (claim, stmt_id),
+                "UPDATE statements SET claim = ?, source = ?, kind = ?, session_id = ?, "
+                "updated = datetime('now') WHERE id = ?",
+                (claim, *provenance, session_id, stmt_id),
             )
             stmts_updated += 1
             continue
@@ -319,6 +356,9 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             claim = item.get("claim", "").strip()
             if not claim:
                 _skip(session_id, action, "missing claim")
+                continue
+            provenance = _parse_provenance(item, action, session_id)
+            if provenance is None:
                 continue
             if not conn.execute(
                 "SELECT 1 FROM topics WHERE id = ?", (topic_id,)
@@ -332,8 +372,9 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             ).fetchone():
                 continue
             conn.execute(
-                "INSERT INTO statements (topic_id, claim) VALUES (?, ?)",
-                (topic_id, claim),
+                "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (topic_id, claim, *provenance, session_id),
             )
             stmts_inserted += 1
             continue
@@ -355,6 +396,9 @@ def process_knowledge(conn, knowledge_list, session_id=None):
         if not tags:
             _skip(session_id, action, "missing tags")
             continue
+        provenance = _parse_provenance(item, action, session_id)
+        if provenance is None:
+            continue
 
         # Exact-match dedup on claim
         if conn.execute(
@@ -368,8 +412,9 @@ def process_knowledge(conn, knowledge_list, session_id=None):
         )
         topic_id = cur.lastrowid
         conn.execute(
-            "INSERT INTO statements (topic_id, claim) VALUES (?, ?)",
-            (topic_id, claim),
+            "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (topic_id, claim, *provenance, session_id),
         )
         topics_inserted += 1
         stmts_inserted += 1

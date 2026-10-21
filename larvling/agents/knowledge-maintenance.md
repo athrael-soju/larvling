@@ -13,7 +13,7 @@ SQLite database at `.claude/larvling.db`.
 
 **Knowledge schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT)`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
 
 **Tasks schema:**
 - `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT CHECK IN ('open','done','dropped'), priority TEXT CHECK IN ('low','medium','high'), horizon TEXT CHECK IN ('now','soon','later'), metadata TEXT, created TEXT, updated TEXT)`

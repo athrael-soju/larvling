@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 def get_schema_version(conn):
@@ -200,7 +200,10 @@ def create_schema(conn):
             topic_id INTEGER NOT NULL REFERENCES topics(id),
             claim TEXT NOT NULL,
             created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            source TEXT CHECK(source IN ('user', 'agent', 'doc', 'manual')),
+            kind TEXT CHECK(kind IN ('fact', 'decision', 'preference', 'assessment')),
+            session_id TEXT REFERENCES sessions(id)
         )
     """
     )
@@ -237,6 +240,9 @@ def create_schema(conn):
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_statements_topic ON statements(topic_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_session ON statements(session_id)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
