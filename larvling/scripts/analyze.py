@@ -686,9 +686,10 @@ def _run(data):
     # Wait for transcript to finish writing before parsing
     wait_for_transcript_stable(transcript_path)
 
-    # Get user text and agent text
-    user_text = parse_last_user_text(transcript_path)
-    agent_text, _ = parse_last_turn(transcript_path)
+    # Get user text and agent text. A turn the user didn't start (a task
+    # notification) has no user text.
+    user_text = parse_last_user_text(transcript_path) or ""
+    agent_text = parse_last_turn(transcript_path)[0] or ""
 
     if not user_text and not agent_text:
         log("extraction_skipped", session_id, reason="no text found")
@@ -726,7 +727,7 @@ def _run(data):
         if cfg["knowledge_extraction"]:
             knowledge = result.get("knowledge", [])
             topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
-                conn, knowledge, session_id, user_text or "", agent_text or ""
+                conn, knowledge, session_id, user_text, agent_text
             )
 
         # Tasks
