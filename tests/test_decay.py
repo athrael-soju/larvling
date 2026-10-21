@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import unittest
 
@@ -15,6 +16,7 @@ import analyze
 import db
 import preflight
 from test_provenance import make_v13_db, run_preflight
+from test_supersession import fill, recipe, run_query
 
 sys.path.insert(0, os.path.join(support.SCRIPTS_DIR, "hooks"))
 import session_start  # noqa: E402
@@ -80,7 +82,12 @@ class TouchTest(unittest.TestCase):
         self.process([{"action": "update_task", "task_id": self.id, "content": "Still blocked on review."}])
         self.assertEqual(self.untouched_days(), 0)
 
-    def test_due_dates_are_stored_and_checked(self):
+    def test_an_update_written_by_sql_touches_the_task(self):
+        # /tidy, or the agent keeping a drop candidate, writes updates directly.
+        run_query(f"INSERT INTO updates (task_id, content) VALUES ({self.id}, 'Keeping this.')")
+        self.assertEqual(self.untouched_days(), 0)
+
+    def test_due_dates_are_stored_and_a_bad_one_is_left_out(self):
         self.process([
             {"action": "add_task", "title": "Renew the TLS certificate", "domain": "technical",
              "priority": "high", "horizon": "soon", "due": "2026-11-03"},
@@ -91,8 +98,9 @@ class TouchTest(unittest.TestCase):
         with db.open_db() as conn:
             dues = dict(conn.execute("SELECT title, due FROM tasks").fetchall())
         self.assertEqual(dues, {"Ship the exporter": "2026-10-30",
-                                "Renew the TLS certificate": "2026-11-03"})
-        self.assertEqual(support.logged("extraction_skipped")[0]["reason"], "invalid due")
+                                "Renew the TLS certificate": "2026-11-03",
+                                "Write the migration guide": None})
+        self.assertEqual(support.logged("extraction_field_dropped")[0]["value"], "next Friday")
 
     def test_the_prompt_dates_the_conversation(self):
         prompt = analyze.build_extraction_prompt([(1, "user", "hi")], SID, day="2026-10-21")
@@ -177,6 +185,66 @@ class DecayTest(unittest.TestCase):
         self.assertEqual(self.horizons()[self.due_later], "later")
         self.assertNotIn("Drop Candidates", context)
         self.assertNotIn("Moved automatically", context)
+
+    def test_a_kept_drop_candidate_is_not_listed_again(self):
+        self.assertIn("Try Bun", self.briefing())
+        run_query(f"INSERT INTO updates (task_id, content) VALUES ({self.stale_soon}, 'Kept.')")
+        self.assertNotIn("Drop Candidates", self.briefing())
+
+    def test_a_due_task_the_user_moved_out_of_now_stays_out(self):
+        self.briefing()
+        self.assertEqual(self.horizons()[self.overdue], "now")
+        with db.open_db() as conn:
+            analyze.process_tasks(conn, [{"action": "update_task", "task_id": self.overdue,
+                                          "horizon": "later", "content": "Not this week."}], SID)
+        self.briefing()
+        self.briefing()
+        self.assertEqual(self.horizons()[self.overdue], "later")
+        self.assertEqual(len([n for n in notes(self.overdue) if "automatically" in n]), 1)
+        # A new due date is a new reason to move it.
+        with db.open_db() as conn:
+            conn.execute("UPDATE tasks SET due = date('now', 'localtime') WHERE id = ?", (self.overdue,))
+        self.briefing()
+        self.assertEqual(self.horizons()[self.overdue], "now")
+
+    def test_tidy_reclassify_and_merge_count_as_touches(self):
+        horizon = recipe("agents/knowledge-maintenance.md", "UPDATE tasks SET horizon")
+        run_query(fill(horizon, horizon="now", id=self.stale_soon))
+        merge = recipe("agents/knowledge-maintenance.md", "INSERT INTO updates (task_id, content) VALUES (<survivor_id>")
+        run_query(fill(merge, survivor_id=self.stale_now, retired_id=self.done))
+        self.briefing()
+        self.assertEqual(self.horizons()[self.stale_soon], "now")
+        self.assertEqual(self.horizons()[self.stale_now], "now")
+
+    def test_a_due_value_written_by_hand_that_isnt_a_date_is_ignored(self):
+        with db.open_db() as conn:
+            conn.execute("UPDATE tasks SET due = '' WHERE id = ?", (self.due_far,))
+            conn.execute("UPDATE tasks SET due = '2026-1-5' WHERE id = ?", (self.stale_soon,))
+        self.briefing()
+        self.assertEqual(notes(self.due_far), [])
+        self.assertEqual(notes(self.stale_soon), [])
+
+    def test_sessions_starting_together_move_each_task_once(self):
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[1] + '/hooks'); "
+                "import session_start; session_start.get_session_context()")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=support.PROJECT_DIR)
+        procs = [subprocess.Popen([sys.executable, "-c", code, support.SCRIPTS_DIR], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                 for _ in range(4)]
+        for p in procs:
+            _, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(len(notes(self.stale_now)), 1)
+        self.assertEqual(len(notes(self.due_later)), 1)
+        self.assertEqual(len(notes(self.overdue)), 1)
+
+    def test_fractional_or_infinite_days_fall_back_to_the_default(self):
+        import config
+
+        for value in (0.5, float("inf"), -3, "7"):
+            with self.subTest(value=value):
+                write_config({"decay_now_days": value})
+                self.assertEqual(config.get_config()["decay_now_days"], 7)
 
     def test_task_tracking_off_leaves_tasks_alone(self):
         write_config({"task_tracking": False})

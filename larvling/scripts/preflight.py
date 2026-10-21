@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from db import (
     DB_PATH,
     SCHEMA_VERSION,
+    TOUCH_TRIGGER,
     open_db,
     log,
     reconfigure_stdout,
@@ -202,12 +203,14 @@ def migrate_v16_to_v17(conn):
 
 
 def migrate_v17_to_v18(conn):
-    """v18: tasks.due, and tasks.updated as the last time a task was touched.
+    """v18: tasks.due, and tasks.updated as the last time a task was touched,
+    which a trigger moves on every update entry.
 
     Earlier versions didn't move updated when an update was added, so it is
     brought up to each task's latest update.
     """
     conn.execute("ALTER TABLE tasks ADD COLUMN due TEXT")
+    conn.execute(TOUCH_TRIGGER)
     cur = conn.execute(
         """
         UPDATE tasks SET updated = (

@@ -156,6 +156,15 @@ def get_desired_schema():
     return schema
 
 
+# An update entry touches its task, however it is written: by extraction, by
+# /tidy, or by the agent keeping a drop candidate. tasks.updated is what task
+# decay goes by.
+TOUCH_TRIGGER = (
+    "CREATE TRIGGER IF NOT EXISTS updates_touch_task AFTER INSERT ON updates BEGIN "
+    "UPDATE tasks SET updated = datetime('now') WHERE id = new.task_id; END"
+)
+
+
 # Statements still in force. A statement leaves it when it is superseded
 # (superseded_by names its replacement) or retired with no replacement.
 CURRENT_STATEMENTS_VIEW = (
@@ -363,6 +372,7 @@ def create_schema(conn):
         )
     """
     )
+    conn.execute(TOUCH_TRIGGER)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
     )

@@ -285,8 +285,7 @@ class WithoutFts5Test(unittest.TestCase):
             self.assertFalse(db.fts_in_step(conn))
             self.assertFalse(db.ensure_fts(conn))
             self.assertTrue(db.fts_in_step(conn))
-            self.assertEqual(
-                conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'").fetchone()[0], 0)
+            self.assertEqual(db._fts_triggers(conn), set())
         conn.commit()
         conn.close()
         # Back on a build with FTS5, the next start rebuilds the index.

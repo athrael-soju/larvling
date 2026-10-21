@@ -366,16 +366,16 @@ def _skip(session_id, action, reason, **extra):
 
 
 def _parse_due(task, action, session_id):
-    """Return the task's due date as YYYY-MM-DD, "" if it has none, or None if
-    it is not a valid date (with logging)."""
+    """Return the task's due date as YYYY-MM-DD, or "" if it has none. A due
+    date that isn't a date is left out and logged; the rest of the item stands."""
     due = _field(task, "due")
     if not due:
         return ""
     try:
         return date.fromisoformat(due).isoformat()
     except ValueError:
-        _skip(session_id, action, "invalid due", due=due[:40])
-        return None
+        log("extraction_field_dropped", session_id, action=action, field="due", value=due[:40])
+        return ""
 
 
 def _parse_id(value, field_name, action, session_id):
@@ -718,12 +718,11 @@ def process_tasks(conn, tasks_list, session_id=None):
                 (task_id, content),
             ).fetchone():
                 continue
+            # Touches the task (db.TOUCH_TRIGGER).
             conn.execute(
                 "INSERT INTO updates (task_id, content) VALUES (?, ?)",
                 (task_id, content),
             )
-            # updated means last touched, which decay goes by.
-            conn.execute("UPDATE tasks SET updated = datetime('now') WHERE id = ?", (task_id,))
             updates_inserted += 1
             continue
 
@@ -767,8 +766,6 @@ def process_tasks(conn, tasks_list, session_id=None):
                 sets.append("title = ?")
                 params.append(title)
             due = _parse_due(task, action, session_id)
-            if due is None:
-                continue
             if due:
                 sets.append("due = ?")
                 params.append(due)
@@ -793,10 +790,6 @@ def process_tasks(conn, tasks_list, session_id=None):
                         "INSERT INTO updates (task_id, content) VALUES (?, ?)",
                         (task_id, content),
                     )
-                    if not sets:
-                        conn.execute(
-                            "UPDATE tasks SET updated = datetime('now') WHERE id = ?", (task_id,)
-                        )
                     updates_inserted += 1
             continue
 
@@ -818,8 +811,6 @@ def process_tasks(conn, tasks_list, session_id=None):
             _skip(session_id, action, "invalid horizon", horizon=horizon)
             continue
         due = _parse_due(task, action, session_id)
-        if due is None:
-            continue
 
         # Dedup: skip if a task with this title exists in ANY status. An open match
         # is a duplicate; a 'dropped' or 'done' match is a tombstone — re-adding it

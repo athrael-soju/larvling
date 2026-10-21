@@ -105,7 +105,7 @@ Run the three phases in order. Within each phase, query first, then group findin
      UPDATE tasks SET status = 'dropped', title = '[Merged into #<survivor_id>] ' || title, updated = datetime('now') WHERE id = <retired_id>;
      INSERT INTO updates (task_id, content) VALUES (<survivor_id>, 'Merged in #<retired_id> during /tidy');
      ```
-   - **Reclassify**: update `domain`, `priority`, or `horizon` (values must match the CHECK constraints above)
+   - **Reclassify**: update `domain`, `priority`, or `horizon` (values must match the CHECK constraints above). A horizon you set is a decision about the task, so it counts as touching it: `UPDATE tasks SET horizon = '<horizon>', updated = datetime('now') WHERE id = <id>`. Otherwise session start may move it straight back. (An update entry touches its task by itself.)
 
 ### Phase 3 — Sessions
 
