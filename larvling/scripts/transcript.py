@@ -75,6 +75,8 @@ def _block_text(content):
 # Claude Code's tool_result when the user rejects a tool call and says why.
 _REJECTION = "The user doesn't want to"
 _REJECTION_FEEDBACK = "the user said:"
+# What Claude Code may append after the feedback; not the user's words.
+_REJECTION_NOTE = "\nNote: The user's next message"
 
 
 def _mid_turn_words(entry, tool_names):
@@ -107,14 +109,15 @@ def _mid_turn_words(entry, tool_names):
         if not isinstance(block, dict) or block.get("type") != "tool_result":
             continue
         result = _block_text(block.get("content"))
-        # Claude Code marks a real rejection as an error and records it as
-        # rejected; tool output that only quotes the wording is neither.
+        # Claude Code marks a real rejection as an error and tags the entry
+        # with toolDenialKind, which tool output can't set; output that only
+        # quotes the wording is neither.
         rejected = (
             block.get("is_error") is True
-            and str(entry.get("toolUseResult", "")).startswith("User rejected")
+            and entry.get("toolDenialKind") == "user-rejected"
         )
         if rejected and result.startswith(_REJECTION) and _REJECTION_FEEDBACK in result:
-            feedback = result.split(_REJECTION_FEEDBACK, 1)[1].strip()
+            feedback = result.split(_REJECTION_FEEDBACK, 1)[1].split(_REJECTION_NOTE, 1)[0].strip()
             if feedback:
                 words.append(feedback)
         elif tool_names.get(block.get("tool_use_id")) == "AskUserQuestion":
