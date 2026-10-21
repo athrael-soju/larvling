@@ -9,7 +9,9 @@ SDK call, then writes results to SQLite.
 import asyncio
 import json
 import os
+import re
 import sys
+import unicodedata
 
 from config import get_config
 from db import (
@@ -43,6 +45,20 @@ VALID_STATUS = {"open", "done", "dropped"}
 # Extraction sets 'user' or 'agent'. /remember sets 'manual'; 'doc' is unused for now.
 VALID_SOURCE = {"user", "agent"}
 VALID_KIND = {"fact", "decision", "preference", "assessment"}
+VALID_ABOUT = {"user", "domain"}
+# (source, kind) pairs extraction may store. Facts about the user come from the
+# user; from the agent, only general facts and assessments the user agreed with.
+ALLOWED_SOURCING = {
+    ("user", "fact"),
+    ("user", "decision"),
+    ("user", "preference"),
+    ("agent", "fact"),
+    ("agent", "assessment"),
+}
+# Shortest evidence and endorsement accepted, in words: a word or two ("I",
+# "my project", "thanks") turns up in almost any message.
+MIN_EVIDENCE_WORDS = 3
+MIN_ENDORSEMENT_WORDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +92,23 @@ Six tables in 3 parent→child pairs:
 
 Read the exchange and list what is worth extracting. Do NOT assign actions yet.
 
-- **Knowledge candidates**: durable facts worth remembering across sessions.
-  - From USER: personal info, professional info, preferences, interests \
-(asking about ANY topic = an interest), decisions, opinions, workflow habits
-  - From AGENT: key domain knowledge shared with the user (science, history, \
-concepts) — NOT code-level implementation details
+- **Knowledge candidates**: durable facts worth remembering across sessions. \
+Who said it decides whether it can be stored:
+  - From USER (source "user"): personal info, professional info, preferences, \
+interests (asking about ANY topic = an interest), decisions, opinions, workflow habits, \
+and facts about the people they deal with. Anything about the user, their work or \
+those people comes from the USER's own words only.
+  - From AGENT (source "agent"): general domain knowledge only (science, history, \
+concepts), true no matter who is asking — NOT code-level implementation details, and \
+NEVER anything about the user's situation. The agent's guesses, inferences and \
+characterisations of the user ("you're probably...", "since your team is small...") \
+are not knowledge: drop them, however plausible.
+  - AGENT recommendations and judgements are dropped too. If the USER adopts a \
+recommendation, that is the user's decision (source "user", kind "decision"). Only \
+when the USER explicitly agrees with an AGENT judgement, store the judgement as kind \
+"assessment" with the user's words of agreement as "endorsement".
+  - A claim says what its evidence says and no more. Do not infer, generalise or \
+combine: "our CI" says nothing about the size of the user's team.
   - Ask: "Is this useful?" If not, do not include it.
   - Prefer fewer, higher-quality items over many low-value ones.
 - **Task candidates**: durable commitments and TODOs that outlive this exchange, \
@@ -136,13 +164,28 @@ new tags from this exchange.
 
 ## Output schema
 
-Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "about": "user|domain", "evidence": "...", "endorsement": "...", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+- topic_title: the subject in a few words (e.g. "CI pipeline", "Octopuses"). Name the \
+subject only: a title never makes a claim about the user.
+- claim: only what the evidence says, with no inference, generalisation or detail \
+taken from elsewhere
 - Domains: personal, professional, preferences, interests, knowledge, technical, workflow
 - Tags: short topic label (e.g. "octopuses", "physics", "python")
-- source: who said it in this exchange: "user" (the USER's message) or "agent" (the AGENT's response)
-- kind: "fact" (something true about the world, the user or their work), "decision" \
-(a choice the user has made), "preference" (how the user likes things done), \
-"assessment" (a judgement, recommendation or guess rather than an established fact)
+- source: whose words the claim comes from: "user" (the USER's message) or "agent" (the AGENT's response)
+- kind: "fact" (something true: about the user, their work or the people they deal \
+with, or general domain knowledge), "decision" (a choice the user has made), \
+"preference" (how the user likes things done, or their opinion), "assessment" (an \
+AGENT judgement the USER explicitly agreed with — nothing else)
+- about: "user" (the user, their work, or the people they deal with) or "domain" \
+(general knowledge, true no matter who is asking)
+- evidence: a span of at least three words copied word for word from the source's \
+message that supports the claim. Do not paraphrase: an item whose evidence is not in \
+that message, or is shorter than three words, is discarded.
+- endorsement: for kind "assessment" only, the USER's words agreeing with it, at least \
+two words copied word for word; otherwise ""
+- Allowed: source "user" with kind fact, decision or preference; source "agent" with \
+kind "fact" and about "domain", or kind "assessment" with an endorsement. Anything else \
+is discarded.
 
 Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high", "horizon": "now|soon|later", "status": "open|done|dropped", "action": "add_task|add_update|update_task", "task_id": N, "content": "..."}}
 - "content" is used for add_update (the fact/note) and update_task (the reason for the change)
@@ -153,7 +196,7 @@ Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high"
 
 Return JSON:
 {{
-  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user", "kind": "fact", "action": "add_topic"}}],
+  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user", "kind": "fact", "about": "user", "evidence": "...", "action": "add_topic"}}],
   "session_tags": ["python", "deployment"],
   "tasks": [{{"title": "refactor auth module", "domain": "technical", "priority": "medium", "horizon": "soon", "action": "add_task"}}]
 }}
@@ -175,6 +218,9 @@ EXTRACTION_SCHEMA = {
                     "tags": {"type": "string"},
                     "source": {"type": "string", "enum": list(VALID_SOURCE)},
                     "kind": {"type": "string", "enum": list(VALID_KIND)},
+                    "about": {"type": "string", "enum": list(VALID_ABOUT)},
+                    "evidence": {"type": "string"},
+                    "endorsement": {"type": "string"},
                     "action": {
                         "type": "string",
                         "enum": [
@@ -194,6 +240,8 @@ EXTRACTION_SCHEMA = {
                     "tags",
                     "source",
                     "kind",
+                    "about",
+                    "evidence",
                     "action",
                 ],
             },
@@ -258,25 +306,108 @@ def _parse_id(value, field_name, action, session_id):
         return None
 
 
-def _parse_provenance(item, action, session_id):
-    """Validate an item's source and kind. Returns (source, kind) or None (with logging)."""
-    source = item.get("source", "").strip().lower()
+def _field(item, key):
+    """Return *item*[*key*] as stripped text; a missing or null value gives ""."""
+    return str(item.get(key) or "").strip()
+
+
+# Kana, CJK ideographs, Thai, Lao, Khmer and Myanmar are written without spaces
+# between words, so quotes in them are matched character by character;
+# otherwise a whole clause would be one word.
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana, CJK
+_SEA = (
+    "\u0e00-\u0eff"  # Thai, Lao
+    "\u1000-\u109f\ua9e0-\ua9ff\uaa60-\uaa7f"  # Myanmar
+    "\u1780-\u17ff\u19e0-\u19ff"  # Khmer
+)
+_UNSPACED = _CJK + _SEA
+# An apostrophe splits a word for matching, so "my team" is found in "my
+# team's CI"; for counting, a contraction ("I'm", "don't") is one word.
+_TOKEN = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+")
+_COUNTED = re.compile(f"[{_CJK}]|[^\\W{_UNSPACED}]+(?:'[^\\W{_UNSPACED}]+)*")
+_SEA_LETTER = re.compile(f"[{_SEA}]")
+# A CJK character is about a word; in Thai, Lao, Khmer and Myanmar a word is
+# several letters, vowel and tone marks aside.
+_SEA_LETTERS_PER_WORD = 3
+_APOSTROPHES = str.maketrans({c: "'" for c in "\u2018\u2019\u02bc`"})
+
+
+def _normalize(text):
+    return unicodedata.normalize("NFKC", text or "").casefold().translate(_APOSTROPHES)
+
+
+def _words(text):
+    """Return the lowercase words of *text*, ignoring punctuation and spacing."""
+    return " ".join(_TOKEN.findall(_normalize(text)))
+
+
+def _word_count(text):
+    """Roughly how many words *text* has (see _COUNTED and _SEA_LETTERS_PER_WORD)."""
+    text = _normalize(text)
+    letters = sum(
+        1 for c in _SEA_LETTER.findall(text) if not unicodedata.category(c).startswith("M")
+    )
+    return len(_COUNTED.findall(text)) + letters / _SEA_LETTERS_PER_WORD
+
+
+def _quoted_in(quote, text):
+    """True when *quote* appears word for word in *text*."""
+    words = _words(quote)
+    return bool(words) and f" {words} " in f" {_words(text)} "
+
+
+def _parse_provenance(item, action, session_id, user_text, agent_text):
+    """Check an item's source, kind and evidence.
+
+    The evidence must appear in the source's message, and an assessment also
+    needs the user's endorsement. Returns (source, kind) or None (with logging).
+    """
+    source = _field(item, "source").lower()
     if source not in VALID_SOURCE:
         _skip(session_id, action, "invalid source", source=source)
         return None
-    kind = item.get("kind", "").strip().lower()
+    kind = _field(item, "kind").lower()
     if kind not in VALID_KIND:
         _skip(session_id, action, "invalid kind", kind=kind)
         return None
+    if (source, kind) not in ALLOWED_SOURCING:
+        _skip(session_id, action, "kind not allowed from source", source=source, kind=kind)
+        return None
+    about = _field(item, "about").lower()
+    if about not in VALID_ABOUT:
+        _skip(session_id, action, "invalid about", about=about)
+        return None
+    if source == "agent" and kind == "fact" and about == "user":
+        _skip(session_id, action, "agent claim about the user")
+        return None
+    # These checks prove only that the quotes are in the exchange, not that
+    # they support the claim; the minimum length stops a stray word passing.
+    evidence = _field(item, "evidence")
+    if not _quoted_in(evidence, user_text if source == "user" else agent_text):
+        _skip(session_id, action, f"evidence not in {source} text", evidence=evidence[:80])
+        return None
+    if _word_count(evidence) < MIN_EVIDENCE_WORDS:
+        _skip(session_id, action, "evidence too short", evidence=evidence[:80])
+        return None
+    if kind == "assessment":
+        endorsement = _field(item, "endorsement")
+        if not _quoted_in(endorsement, user_text):
+            _skip(session_id, action, "assessment not endorsed by user")
+            return None
+        if _word_count(endorsement) < MIN_ENDORSEMENT_WORDS:
+            _skip(session_id, action, "endorsement too short", endorsement=endorsement[:80])
+            return None
     return source, kind
 
 
-def process_knowledge(conn, knowledge_list, session_id=None):
+def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent_text=""):
     """Process extracted knowledge into topics+statements tables.
 
     Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
     Each statement written gets a source, kind and session_id; updating a
     statement replaces them.
+    *user_text* and *agent_text* are the exchange the items came from, used
+    to check each item's evidence.
     Never deletes data — retirement is done via updates, not removal.
     Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
     """
@@ -289,7 +420,7 @@ def process_knowledge(conn, knowledge_list, session_id=None):
     topics_updated = 0
 
     for item in knowledge_list:
-        action = item.get("action", "").strip().lower()
+        action = _field(item, "action").lower()
         if action not in (
             "add_topic",
             "add_statement",
@@ -307,12 +438,12 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             ).fetchone():
                 _skip(session_id, action, "topic not found", topic_id=topic_id)
                 continue
-            title = item.get("topic_title", "").strip()
-            domain = item.get("domain", "").strip().lower()
+            title = _field(item, "topic_title")
+            domain = _field(item, "domain").lower()
             if domain and domain not in VALID_DOMAINS:
                 _skip(session_id, action, "invalid domain", domain=domain)
                 continue
-            tags = item.get("tags", "").strip()
+            tags = _field(item, "tags")
             if title:
                 conn.execute(
                     "UPDATE topics SET title = ?, domain = COALESCE(?, domain), "
@@ -328,11 +459,11 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             )
             if stmt_id is None:
                 continue
-            claim = item.get("claim", "").strip()
+            claim = _field(item, "claim")
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id)
+            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -352,11 +483,11 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             topic_id = _parse_id(item.get("topic_id"), "topic_id", action, session_id)
             if topic_id is None:
                 continue
-            claim = item.get("claim", "").strip()
+            claim = _field(item, "claim")
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id)
+            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -379,23 +510,23 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             continue
 
         # add_topic: new topic + first statement
-        claim = item.get("claim", "").strip()
+        claim = _field(item, "claim")
         if not claim:
             _skip(session_id, action, "missing claim")
             continue
-        topic_title = item.get("topic_title", "").strip()
+        topic_title = _field(item, "topic_title")
         if not topic_title:
             _skip(session_id, action, "missing topic_title")
             continue
-        domain = item.get("domain", "").strip().lower()
+        domain = _field(item, "domain").lower()
         if not domain or domain not in VALID_DOMAINS:
             _skip(session_id, action, "invalid domain", domain=domain)
             continue
-        tags = item.get("tags", "").strip()
+        tags = _field(item, "tags")
         if not tags:
             _skip(session_id, action, "missing tags")
             continue
-        provenance = _parse_provenance(item, action, session_id)
+        provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
         if provenance is None:
             continue
 
@@ -435,7 +566,7 @@ def process_tasks(conn, tasks_list, session_id=None):
     tasks_updated = 0
 
     for task in tasks_list:
-        action = task.get("action", "").strip().lower()
+        action = _field(task, "action").lower()
         if action not in ("add_task", "add_update", "update_task"):
             continue
 
@@ -443,7 +574,7 @@ def process_tasks(conn, tasks_list, session_id=None):
             task_id = _parse_id(task.get("task_id"), "task_id", action, session_id)
             if task_id is None:
                 continue
-            content = task.get("content", "").strip()
+            content = _field(task, "content")
             if not content:
                 _skip(session_id, action, "missing content")
                 continue
@@ -469,7 +600,7 @@ def process_tasks(conn, tasks_list, session_id=None):
             task_id = _parse_id(task.get("task_id"), "task_id", action, session_id)
             if task_id is None:
                 continue
-            content = task.get("content", "").strip()
+            content = _field(task, "content")
             if not conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
             ).fetchone():
@@ -479,28 +610,28 @@ def process_tasks(conn, tasks_list, session_id=None):
             # Build SET clause — skip invalid enum values
             sets = []
             params = []
-            status = task.get("status", "").strip().lower()
+            status = _field(task, "status").lower()
             if status:
                 if status not in VALID_STATUS:
                     _skip(session_id, action, "invalid status", status=status)
                     continue
                 sets.append("status = ?")
                 params.append(status)
-            priority = task.get("priority", "").strip().lower()
+            priority = _field(task, "priority").lower()
             if priority:
                 if priority not in VALID_PRIORITY:
                     _skip(session_id, action, "invalid priority", priority=priority)
                     continue
                 sets.append("priority = ?")
                 params.append(priority)
-            horizon = task.get("horizon", "").strip().lower()
+            horizon = _field(task, "horizon").lower()
             if horizon:
                 if horizon not in VALID_HORIZON:
                     _skip(session_id, action, "invalid horizon", horizon=horizon)
                     continue
                 sets.append("horizon = ?")
                 params.append(horizon)
-            title = task.get("title", "").strip()
+            title = _field(task, "title")
             if title:
                 sets.append("title = ?")
                 params.append(title)
@@ -529,19 +660,19 @@ def process_tasks(conn, tasks_list, session_id=None):
             continue
 
         # add_task: new task
-        title = task.get("title", "").strip()
+        title = _field(task, "title")
         if not title:
             _skip(session_id, action, "missing title")
             continue
-        domain = task.get("domain", "").strip().lower()
+        domain = _field(task, "domain").lower()
         if not domain or domain not in VALID_DOMAINS:
             _skip(session_id, action, "invalid domain", domain=domain)
             continue
-        priority = task.get("priority", "").strip().lower()
+        priority = _field(task, "priority").lower()
         if not priority or priority not in VALID_PRIORITY:
             _skip(session_id, action, "invalid priority", priority=priority)
             continue
-        horizon = task.get("horizon", "").strip().lower()
+        horizon = _field(task, "horizon").lower()
         if not horizon or horizon not in VALID_HORIZON:
             _skip(session_id, action, "invalid horizon", horizon=horizon)
             continue
@@ -615,9 +746,10 @@ def _run(data):
     # Wait for transcript to finish writing before parsing
     wait_for_transcript_stable(transcript_path)
 
-    # Get user text and agent text
-    user_text = parse_last_user_text(transcript_path)
-    agent_text, _ = parse_last_turn(transcript_path)
+    # Get user text and agent text. A turn the user didn't start (a task
+    # notification) has no user text.
+    user_text = parse_last_user_text(transcript_path) or ""
+    agent_text = parse_last_turn(transcript_path)[0] or ""
 
     if not user_text and not agent_text:
         log("extraction_skipped", session_id, reason="no text found")
@@ -655,7 +787,7 @@ def _run(data):
         if cfg["knowledge_extraction"]:
             knowledge = result.get("knowledge", [])
             topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
-                conn, knowledge, session_id
+                conn, knowledge, session_id, user_text, agent_text
             )
 
         # Tasks
