@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.36](https://github.com/athrael-soju/larvling/compare/v0.1.35...v0.1.36) (2026-10-21)
+
+
+### Bug Fixes
+
+* run extraction in an isolated session and stop false recording warnings ([#85](https://github.com/athrael-soju/larvling/issues/85)) ([3fdce45](https://github.com/athrael-soju/larvling/commit/3fdce45c9896d3350f91a4973cbf82da8d5e3812))
+
 ## [0.1.35](https://github.com/athrael-soju/larvling/compare/v0.1.34...v0.1.35) (2026-10-21)
 
 
