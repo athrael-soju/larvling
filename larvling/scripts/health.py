@@ -33,6 +33,29 @@ _HEALTH_WINDOW = 15
 # Two-in-a-row avoids crying wolf over a single fluke (e.g. a session that
 # crashed before its Stop hook fired).
 _GAP_THRESHOLD = 2
+# Extraction calls the model through the Agent SDK, and each call leaves a
+# transcript in the same directory, named by an entrypoint like "sdk-py". Those
+# sessions are never recorded, and since extraction runs after a session ends
+# they are often the newest transcripts, so the check skips them.
+_SDK_ENTRYPOINT = "sdk"
+# A transcript names its entrypoint within its first few entries.
+_ENTRYPOINT_LINES = 50
+
+
+def _written_by_sdk(path):
+    """True if the transcript at *path* is from an Agent SDK session."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(_ENTRYPOINT_LINES), f):
+                try:
+                    entrypoint = json.loads(line).get("entrypoint")
+                except (ValueError, AttributeError):
+                    continue
+                if entrypoint:
+                    return str(entrypoint).startswith(_SDK_ENTRYPOINT)
+    except OSError:
+        pass
+    return False
 
 
 def record_failure(stage, error):
@@ -78,7 +101,8 @@ def recording_gap(conn, payload):
     payload's ``transcript_path``), which is written for every session whether
     or not Larvling's hooks ran. Returns the number of consecutive most-recent
     substantial sessions missing from Larvling's DB, or 0 when there is no
-    trustworthy signal — so it never cries wolf.
+    trustworthy signal — so it never cries wolf. Transcripts left by
+    extraction's own model calls aren't sessions, so they are skipped.
     """
     transcript_path = (payload or {}).get("transcript_path")
     session_id = (payload or {}).get("session_id")
@@ -111,7 +135,7 @@ def recording_gap(conn, payload):
             continue
         if st.st_size < _SUBSTANTIAL_BYTES:
             continue
-        entries.append((st.st_mtime, stem))
+        entries.append((st.st_mtime, stem, full))
 
     if not entries:
         return 0
@@ -126,9 +150,10 @@ def recording_gap(conn, payload):
     # that starts at the most recent session means recording is broken *now*;
     # older gaps (pre-install, a one-off empty session) stop the count early.
     missing = 0
-    for _, stem in entries[:_HEALTH_WINDOW]:
-        if stem in recorded:
+    for _, stem, full in entries:
+        if stem in recorded or missing >= _HEALTH_WINDOW:
             break
-        missing += 1
+        if not _written_by_sdk(full):
+            missing += 1
 
     return missing if missing >= _GAP_THRESHOLD else 0
