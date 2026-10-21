@@ -542,15 +542,25 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 continue
             if old["claim"] == claim:
                 continue
-            cur = conn.execute(
-                "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (old["topic_id"], claim, *provenance, session_id),
-            )
+            # The new claim may already be current (a legacy correction stored
+            # next to what it corrects): point at it instead of a second copy.
+            existing = conn.execute(
+                "SELECT id FROM current_statements WHERE claim = ? AND id != ? "
+                "ORDER BY id DESC LIMIT 1",
+                (claim, stmt_id),
+            ).fetchone()
+            if existing:
+                new_id = existing["id"]
+            else:
+                new_id = conn.execute(
+                    "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (old["topic_id"], claim, *provenance, session_id),
+                ).lastrowid
             conn.execute(
                 "UPDATE statements SET superseded_by = ?, superseded_at = datetime('now') "
                 "WHERE id = ?",
-                (cur.lastrowid, stmt_id),
+                (new_id, stmt_id),
             )
             stmts_superseded += 1
             continue

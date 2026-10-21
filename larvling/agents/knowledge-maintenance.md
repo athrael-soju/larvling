@@ -65,13 +65,15 @@ Run the three phases in order. Within each phase, query first, then group findin
      UPDATE topics SET title = '[Merged into #<surviving_id>] ' || title WHERE id = <retired_id>;
      ```
    - **Never rewrite a claim in place.** Every change to a claim goes through supersession, so the history stays queryable.
-   - **Resolve contradictions / correct stale claims**: add the corrected statement and supersede the outdated one. Run the two separately (each `query.py` call is its own connection, so `last_insert_rowid()` won't work across them):
+   - **Resolve contradictions / correct stale claims**: add the corrected statement and supersede the outdated one. The corrected wording is yours, so it is recorded as `manual` in this session, not with the old statement's provenance. Run the two separately (each `query.py` call is its own connection, so `last_insert_rowid()` won't work across them); the guards make the second a no-op when the old statement is already superseded or the insert failed:
      ```sql
-     INSERT INTO statements (topic_id, claim, source, kind, session_id) SELECT topic_id, '<corrected claim>', source, kind, session_id FROM statements WHERE id = <old_id>;
-     UPDATE statements SET superseded_by = (SELECT MAX(id) FROM statements WHERE claim = '<corrected claim>'), superseded_at = datetime('now') WHERE id = <old_id>;
+     INSERT INTO statements (topic_id, claim, source, kind, session_id) SELECT topic_id, '<corrected claim>', 'manual', kind, (SELECT id FROM sessions WHERE id = '<session id>') FROM statements WHERE id = <old_id>;
+     UPDATE statements SET superseded_by = (SELECT MAX(id) FROM current_statements WHERE claim = '<corrected claim>' AND id != <old_id>), superseded_at = datetime('now') WHERE id = <old_id> AND superseded_at IS NULL AND EXISTS (SELECT 1 FROM current_statements WHERE claim = '<corrected claim>' AND id != <old_id>);
      ```
-   - **Redundant statements**: supersede the duplicate with the survivor: `UPDATE statements SET superseded_by = <survivor_id>, superseded_at = datetime('now') WHERE id = <duplicate_id>`
-   - **Retire statements** that are no longer true and have no replacement: `UPDATE statements SET superseded_at = datetime('now') WHERE id = <id>`
+     `<session id>` is the one `/tidy` passed you; leave the subquery as written if you weren't given one (it stores NULL).
+   - **Redundant statements**: supersede the duplicate with the survivor: `UPDATE statements SET superseded_by = <survivor_id>, superseded_at = datetime('now') WHERE id = <duplicate_id> AND superseded_at IS NULL AND <survivor_id> != <duplicate_id> AND EXISTS (SELECT 1 FROM current_statements WHERE id = <survivor_id>)`
+   - **Retire statements** that are no longer true and have no replacement: `UPDATE statements SET superseded_at = datetime('now') WHERE id = <id> AND superseded_at IS NULL`
+   - Any of these reporting `0 row(s) affected` means a guard stopped it: the statement was already superseded, or its replacement isn't current. Re-query before trying again.
    - **Reclassify**: update `domain` or `tags` on the topic
 
 ### Phase 2 — Tasks (tasks + updates)

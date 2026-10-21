@@ -22,7 +22,7 @@ Create tasks to track the audit phases so the user sees progress:
 3. **Audit sessions** (activeForm: "Auditing sessions") — untitled, empty, missing summaries
 4. **Apply approved changes** (activeForm: "Applying changes") — mark complete after agent finishes
 
-Delegate the full audit to the `knowledge-maintenance` agent. It will inspect each area, identify issues (duplicates, stale entries, misclassifications, contradictions, orphaned or empty rows), propose changes via AskUserQuestion, and apply only what the user approves.
+Delegate the full audit to the `knowledge-maintenance` agent, telling it this session's ID (`${CLAUDE_SESSION_ID}`) for the statements it writes. It will inspect each area, identify issues (duplicates, stale entries, misclassifications, contradictions, orphaned or empty rows), propose changes via AskUserQuestion, and apply only what the user approves.
 
 Once the agent completes, present a brief before/after summary. Do not send follow-up messages to the agent after it finishes.
 
