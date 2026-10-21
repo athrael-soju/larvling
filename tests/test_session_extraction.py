@@ -5,6 +5,7 @@ LiveCorrectionTest calls the model, so it only runs with LARVLING_LIVE_TESTS=1.
 """
 
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -354,6 +355,12 @@ class PreCompactTest(unittest.TestCase):
 
 
 class ChunkTest(unittest.TestCase):
+    def test_a_long_run_of_user_messages_still_fills_chunks(self):
+        messages = [(n, "user", "x" * 10) for n in range(1, 21)]
+        chunks = analyze.chunk_messages(messages, budget=60)
+        self.assertLessEqual(len(chunks), 6)
+        self.assertEqual([m[0] for c in chunks for m in c], list(range(1, 21)))
+
     def test_a_prompt_and_what_the_user_added_stay_with_the_answer(self):
         messages = [(1, "user", "a" * 10), (2, "assistant", "b" * 10),
                     (3, "user", "c" * 10), (4, "user", "d" * 10), (5, "assistant", "e" * 10)]
@@ -397,13 +404,40 @@ class CatchUpTest(unittest.TestCase):
         extract(model, data)
         self.assertEqual(len(model.prompts), 1)
 
+    def test_catch_up_relabels_from_the_transcript_session_start_points_at(self):
+        # OTHER crashed mid-turn, before Stop relabelled the prompt another
+        # session sent it.
+        text = "Message from session B: the deploy finished."
+        with db.open_db() as conn:
+            db.record_message(conn, OTHER, "user", text)
+            db.record_message(conn, OTHER, "assistant", "Noted.")
+            conn.execute("UPDATE messages SET timestamp = datetime('now', '-60 minutes')")
+        transcripts = os.path.join(support.PROJECT_DIR, "relabel-transcripts")
+        os.makedirs(transcripts, exist_ok=True)
+        other = write_transcript(os.path.join("relabel-transcripts", f"{OTHER}.jsonl"), [
+            {"type": "user", "isMeta": True, "promptSource": "system",
+             "message": {"role": "user", "content": text}},
+        ])
+        quiet = os.path.getmtime(other) - 3600
+        os.utime(other, (quiet, quiet))
+
+        with mock.patch.object(session_start, "spawn_with_payload") as spawn:
+            session_start.start_catch_up(SID, os.path.join(transcripts, f"{SID}.jsonl"))
+        payload = json.loads(spawn.call_args.args[1])
+        model = FakeModel({"knowledge": [fact("Deploy finished", "the deploy finished")]})
+        extract(model, payload)
+        self.assertEqual(len(model.prompts), 1)
+        self.assertNotIn(f"USER: {text}", model.prompts[0])
+        self.assertEqual(claims(), [])
+
     def test_session_start_spawns_a_worker_only_when_needed(self):
         with mock.patch.object(session_start, "spawn_with_payload") as spawn:
             session_start.start_catch_up(SID)
         spawn.assert_called_once()
         script, payload = spawn.call_args.args
         self.assertTrue(script.endswith(os.path.join("scripts", "analyze.py")))
-        self.assertEqual(json.loads(payload), {"catch_up": True, "session_id": SID})
+        self.assertEqual(json.loads(payload),
+                         {"catch_up": True, "session_id": SID, "transcript_path": None})
 
         extract(FakeModel(), {"catch_up": True, "session_id": SID})
         with mock.patch.object(session_start, "spawn_with_payload") as spawn:
@@ -420,24 +454,64 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(result, "migrate")
         self.assertIn(preflight.MARK_EXTRACTED, out)
 
-    def test_a_worker_on_a_db_its_session_couldnt_migrate_migrates_it(self):
-        # The session started while another held the DB, so it is still at
-        # v13; what it recorded after the old code's last extraction is new.
+    def busy_start_db(self):
+        """A v13 DB holding a session that started while another held the DB:
+        recorded by this version, after the old code's last extraction."""
         support.reset_db()
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        def ago(minutes):
+            return (now - datetime.timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+
         make_v13_db(messages=[
-            ("sess-a", "2026-05-01 10:00:00", "user", "I live in Lisbon"),
-            ("sess-a", "2026-05-01 10:01:00", "assistant", "Noted."),
-            ("sess-a", "2026-05-01 10:03:00", "system", MARKER),
-            ("sess-a", "2026-05-01 10:05:00", "user", "I work at a bank."),
-            ("sess-a", "2026-05-01 10:06:00", "assistant", "Noted too."),
+            ("sess-a", ago(30), "user", "I live in Lisbon"),
+            ("sess-a", ago(29), "assistant", "Noted."),
+            ("sess-a", ago(28), "system", MARKER),
+            ("sess-a", ago(20), "user", "I work at a bank."),
+            ("sess-a", ago(19), "assistant", "Noted too."),
+            # Inactive for longer than a day: counted as extracted.
+            ("sess-b", "2026-05-01 11:00:00", "user", "/remember I prefer tabs"),
+            ("sess-b", "2026-05-01 11:02:00", "assistant", "Stored."),
         ])
+
+    def assert_only_the_new_part_is_extracted(self):
         model = FakeModel()
         extract(model, {"session_id": "sess-a", "hook_event_name": "SessionEnd"})
-        with db.open_db() as conn:
-            self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
         self.assertEqual(len(model.prompts), 1)
         self.assertIn("[1] USER: I work at a bank.", model.prompts[0])
         self.assertNotIn("Lisbon", model.prompts[0])
+        with db.open_db() as conn:
+            self.assertEqual(analyze.pending_sessions(conn, idle_minutes=0), [])
+
+    def test_a_worker_on_a_db_its_session_couldnt_migrate_migrates_it(self):
+        self.busy_start_db()
+        self.assert_only_the_new_part_is_extracted()
+        with db.open_db() as conn:
+            self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
+
+    def test_a_prompt_recorded_before_the_last_marker_is_still_extracted(self):
+        # Old code wrote exchange 1's marker after prompt 2 was recorded, and
+        # exchange 2 never got its own.
+        support.reset_db()
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        make_v13_db(messages=[
+            ("sess-a", now, "user", "I live in Lisbon"),
+            ("sess-a", now, "assistant", "Noted."),
+            ("sess-a", now, "user", "I work at a bank."),
+            ("sess-a", now, "system", MARKER),
+            ("sess-a", now, "assistant", "Noted too."),
+        ])
+        self.assertEqual(run_preflight()[0], "migrated")
+        model = FakeModel()
+        extract(model, {"session_id": "sess-a", "hook_event_name": "SessionEnd"})
+        self.assertIn("[1] USER: I work at a bank.", model.prompts[0])
+        self.assertIn("[2] AGENT: Noted too.", model.prompts[0])
+        self.assertNotIn("Lisbon", model.prompts[0])
+
+    def test_a_session_another_terminal_migrated_under_is_still_extracted(self):
+        self.busy_start_db()
+        self.assertEqual(run_preflight()[0], "migrated")
+        self.assert_only_the_new_part_is_extracted()
 
     def test_an_upgraded_db_counts_earlier_messages_as_extracted(self):
         support.reset_db()

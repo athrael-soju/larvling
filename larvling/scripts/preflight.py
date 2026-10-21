@@ -148,8 +148,12 @@ def migrate_v13_to_v14(conn):
 def migrate_v14_to_v15(conn):
     """v15: track per-session extraction on sessions.
 
-    Earlier versions extracted after every exchange, so every message already
-    recorded counts as extracted.
+    Earlier versions extracted after every exchange, so messages already
+    recorded count as extracted. A session active in the last day may have
+    been recorded by this version while the DB waited for its migration (a
+    busy start): there, only the exchanges up to the reply before its last
+    "Extraction:" message count (that message can land after the next prompt),
+    and catch-up extracts the rest.
     """
     conn.execute("ALTER TABLE sessions ADD COLUMN extracted_at TEXT")
     conn.execute("ALTER TABLE sessions ADD COLUMN extracted_through INTEGER")
@@ -163,6 +167,18 @@ UPDATE sessions SET
     extracted_through = (
         SELECT MAX(m.id) FROM messages m
         WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+        AND (
+            (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id)
+                < datetime('now', '-1 day')
+            OR m.id <= (
+                SELECT MAX(r.id) FROM messages r
+                WHERE r.session_id = sessions.id AND r.role = 'assistant' AND r.id < (
+                    SELECT MAX(id) FROM messages
+                    WHERE session_id = sessions.id AND role = 'system'
+                    AND content LIKE 'Extraction:%'
+                )
+            )
+        )
     ),
     extracted_at = datetime('now')
 WHERE extracted_through IS NULL AND EXISTS (

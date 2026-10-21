@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 
@@ -278,3 +279,20 @@ class StopRecordingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentPromptsTest(unittest.TestCase):
+    def test_a_users_prompt_with_ide_tags_is_not_an_agent_prompt(self):
+        text = "Check the deploy status."
+        path = os.path.join(tempfile.mkdtemp(), "t.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for e in [
+                {"type": "user", "isMeta": True, "promptSource": "system",
+                 "message": {"role": "user", "content": text}},
+                {"type": "user", "message": {"role": "user", "content":
+                    f"<ide_opened_file>a.py</ide_opened_file>{text}"}},
+                {"type": "user", "isMeta": True, "promptSource": "system",
+                 "message": {"role": "user", "content": "Run the nightly report."}},
+            ]:
+                f.write(json.dumps(e) + "\n")
+        self.assertEqual(transcript.agent_prompts(path), {"Run the nightly report."})
