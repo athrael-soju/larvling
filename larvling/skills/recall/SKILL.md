@@ -10,6 +10,8 @@ argument-hint: "[search term]"
 
 Search for relevant knowledge by keyword, topic, or any available context. Use JOINs to show topic context with statements.
 
+Leave out assessments by default: add `s.kind IS NOT 'assessment'` to the `WHERE` clause (`IS NOT` keeps older statements whose `kind` is NULL). Assessments are agent judgements the user agreed with, not established facts. Include them only when the user asks for opinions, recommendations or assessments, or for everything; then mark each one `(assessment)`.
+
 Run SQL via:
 ```
 $PY "${CLAUDE_PLUGIN_ROOT}/scripts/query.py" "<SQL>"

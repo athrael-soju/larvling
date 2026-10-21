@@ -270,6 +270,8 @@ class MigrationTest(unittest.TestCase):
 
 class ProcessKnowledgeTest(unittest.TestCase):
     SID = "sess-1"
+    USER = "I prefer tabs over spaces. Actually, I use spaces in YAML."
+    AGENT = "Tabs usually render at a width of 4 in most editors."
 
     def setUp(self):
         support.reset_db()
@@ -288,10 +290,15 @@ class ProcessKnowledgeTest(unittest.TestCase):
             "tags": "editor",
             "source": "user",
             "kind": "preference",
+            "about": "user",
+            "evidence": "I prefer tabs over spaces",
             "action": "add_topic",
         }
         item.update(overrides)
         return item
+
+    def process(self, items, session_id=SID):
+        return analyze.process_knowledge(self.conn, items, session_id, self.USER, self.AGENT)
 
     def provenance(self, stmt_id):
         return tuple(
@@ -308,24 +315,23 @@ class ProcessKnowledgeTest(unittest.TestCase):
         self.assertEqual(set(items["properties"]["source"]["enum"]), {"user", "agent"})
 
     def test_new_statements_carry_provenance(self):
-        analyze.process_knowledge(self.conn, [self.item()], self.SID)
+        self.process([self.item()])
         topic_id = self.conn.execute("SELECT id FROM topics").fetchone()[0]
-        analyze.process_knowledge(
-            self.conn,
-            [self.item(action="add_statement", topic_id=topic_id,
-                       claim="Tabs render at width 4", source="agent", kind="fact")],
-            self.SID,
-        )
+        self.process([
+            self.item(action="add_statement", topic_id=topic_id,
+                      claim="Tabs usually render at width 4", source="agent", kind="fact",
+                      about="domain", evidence="Tabs usually render at a width of 4"),
+        ])
         self.assertEqual(self.provenance(1), ("user", "preference", self.SID))
         self.assertEqual(self.provenance(2), ("agent", "fact", self.SID))
 
     def test_update_takes_the_updaters_provenance(self):
-        analyze.process_knowledge(self.conn, [self.item()], self.SID)
+        self.process([self.item()])
         db.ensure_session(self.conn, "sess-2")
-        analyze.process_knowledge(
-            self.conn,
+        self.process(
             [self.item(action="update_statement", statement_id=1,
-                       claim="Uses tabs, but spaces in YAML", kind="decision")],
+                       claim="Uses tabs, but spaces in YAML", kind="decision",
+                       evidence="I use spaces in YAML")],
             "sess-2",
         )
         self.assertEqual(self.provenance(1), ("user", "decision", "sess-2"))
@@ -337,8 +343,7 @@ class ProcessKnowledgeTest(unittest.TestCase):
             self.item(kind="rumour"),
             self.item(kind=""),
         ]
-        counts = analyze.process_knowledge(self.conn, bad_items, self.SID)
-        self.assertEqual(counts, (0, 0, 0, 0))
+        self.assertEqual(self.process(bad_items), (0, 0, 0, 0))
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0], 0)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0], 0)
 

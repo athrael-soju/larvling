@@ -272,9 +272,11 @@ def get_session_context():
                 domains = ", ".join(
                     f"{r['d']} ({r['c']})" for r in domain_rows
                 )
+                # Leave out assessments: they are opinions, not facts.
                 recent = conn.execute(
                     "SELECT t.id, t.title, s.id as sid, s.claim "
                     "FROM topics t JOIN statements s ON s.topic_id = t.id "
+                    "WHERE s.kind IS NOT 'assessment' "
                     "ORDER BY s.updated DESC, s.created DESC LIMIT 5"
                 ).fetchall()
                 lines.append(f"## Stored Knowledge ({topic_count} topics, {stmt_count} statements)")

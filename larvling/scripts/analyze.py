@@ -9,7 +9,9 @@ SDK call, then writes results to SQLite.
 import asyncio
 import json
 import os
+import re
 import sys
+import unicodedata
 
 from config import get_config
 from db import (
@@ -43,6 +45,16 @@ VALID_STATUS = {"open", "done", "dropped"}
 # Extraction sets 'user' or 'agent'. /remember sets 'manual'; 'doc' is unused for now.
 VALID_SOURCE = {"user", "agent"}
 VALID_KIND = {"fact", "decision", "preference", "assessment"}
+VALID_ABOUT = {"user", "domain"}
+# (source, kind) pairs extraction may store. Facts about the user come from the
+# user; from the agent, only general facts and assessments the user agreed with.
+ALLOWED_SOURCING = {
+    ("user", "fact"),
+    ("user", "decision"),
+    ("user", "preference"),
+    ("agent", "fact"),
+    ("agent", "assessment"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +88,21 @@ Six tables in 3 parent→child pairs:
 
 Read the exchange and list what is worth extracting. Do NOT assign actions yet.
 
-- **Knowledge candidates**: durable facts worth remembering across sessions.
-  - From USER: personal info, professional info, preferences, interests \
-(asking about ANY topic = an interest), decisions, opinions, workflow habits
-  - From AGENT: key domain knowledge shared with the user (science, history, \
-concepts) — NOT code-level implementation details
+- **Knowledge candidates**: durable facts worth remembering across sessions. \
+Who said it decides whether it can be stored:
+  - From USER (source "user"): personal info, professional info, preferences, \
+interests (asking about ANY topic = an interest), decisions, opinions, workflow habits, \
+and facts about the people they deal with. Anything about the user, their work or \
+those people comes from the USER's own words only.
+  - From AGENT (source "agent"): general domain knowledge only (science, history, \
+concepts), true no matter who is asking — NOT code-level implementation details, and \
+NEVER anything about the user's situation. The agent's guesses, inferences and \
+characterisations of the user ("you're probably...", "since your team is small...") \
+are not knowledge: drop them, however plausible.
+  - AGENT recommendations and judgements are dropped too. If the USER adopts a \
+recommendation, that is the user's decision (source "user", kind "decision"). Only \
+when the USER explicitly agrees with an AGENT judgement, store the judgement as kind \
+"assessment" with the user's words of agreement as "endorsement".
   - Ask: "Is this useful?" If not, do not include it.
   - Prefer fewer, higher-quality items over many low-value ones.
 - **Task candidates**: durable commitments and TODOs that outlive this exchange, \
@@ -136,13 +158,23 @@ new tags from this exchange.
 
 ## Output schema
 
-Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "about": "user|domain", "evidence": "...", "endorsement": "...", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
 - Domains: personal, professional, preferences, interests, knowledge, technical, workflow
 - Tags: short topic label (e.g. "octopuses", "physics", "python")
-- source: who said it in this exchange: "user" (the USER's message) or "agent" (the AGENT's response)
-- kind: "fact" (something true about the world, the user or their work), "decision" \
-(a choice the user has made), "preference" (how the user likes things done), \
-"assessment" (a judgement, recommendation or guess rather than an established fact)
+- source: whose words the claim comes from: "user" (the USER's message) or "agent" (the AGENT's response)
+- kind: "fact" (something true: about the user, their work or the people they deal \
+with, or general domain knowledge), "decision" (a choice the user has made), \
+"preference" (how the user likes things done, or their opinion), "assessment" (an \
+AGENT judgement the USER explicitly agreed with — nothing else)
+- about: "user" (the user, their work, or the people they deal with) or "domain" \
+(general knowledge, true no matter who is asking)
+- evidence: a short span copied word for word from the source's message that supports \
+the claim. Do not paraphrase: an item whose evidence is not in that message is discarded.
+- endorsement: for kind "assessment" only, the USER's words agreeing with it, copied \
+word for word; otherwise ""
+- Allowed: source "user" with kind fact, decision or preference; source "agent" with \
+kind "fact" and about "domain", or kind "assessment" with an endorsement. Anything else \
+is discarded.
 
 Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high", "horizon": "now|soon|later", "status": "open|done|dropped", "action": "add_task|add_update|update_task", "task_id": N, "content": "..."}}
 - "content" is used for add_update (the fact/note) and update_task (the reason for the change)
@@ -153,7 +185,7 @@ Each task item: {{"title": "...", "domain": "...", "priority": "low|medium|high"
 
 Return JSON:
 {{
-  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user", "kind": "fact", "action": "add_topic"}}],
+  "knowledge": [{{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user", "kind": "fact", "about": "user", "evidence": "...", "action": "add_topic"}}],
   "session_tags": ["python", "deployment"],
   "tasks": [{{"title": "refactor auth module", "domain": "technical", "priority": "medium", "horizon": "soon", "action": "add_task"}}]
 }}
@@ -175,6 +207,9 @@ EXTRACTION_SCHEMA = {
                     "tags": {"type": "string"},
                     "source": {"type": "string", "enum": list(VALID_SOURCE)},
                     "kind": {"type": "string", "enum": list(VALID_KIND)},
+                    "about": {"type": "string", "enum": list(VALID_ABOUT)},
+                    "evidence": {"type": "string"},
+                    "endorsement": {"type": "string"},
                     "action": {
                         "type": "string",
                         "enum": [
@@ -194,6 +229,8 @@ EXTRACTION_SCHEMA = {
                     "tags",
                     "source",
                     "kind",
+                    "about",
+                    "evidence",
                     "action",
                 ],
             },
@@ -258,8 +295,23 @@ def _parse_id(value, field_name, action, session_id):
         return None
 
 
-def _parse_provenance(item, action, session_id):
-    """Validate an item's source and kind. Returns (source, kind) or None (with logging)."""
+def _words(text):
+    """Return the lowercase words of *text*, ignoring punctuation and spacing."""
+    return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text or "").casefold()))
+
+
+def _quoted_in(quote, text):
+    """True when *quote* appears word for word in *text*."""
+    words = _words(quote)
+    return bool(words) and f" {words} " in f" {_words(text)} "
+
+
+def _parse_provenance(item, action, session_id, user_text, agent_text):
+    """Check an item's source, kind and evidence.
+
+    The evidence must appear in the source's message, and an assessment also
+    needs the user's endorsement. Returns (source, kind) or None (with logging).
+    """
     source = item.get("source", "").strip().lower()
     if source not in VALID_SOURCE:
         _skip(session_id, action, "invalid source", source=source)
@@ -268,15 +320,34 @@ def _parse_provenance(item, action, session_id):
     if kind not in VALID_KIND:
         _skip(session_id, action, "invalid kind", kind=kind)
         return None
+    if (source, kind) not in ALLOWED_SOURCING:
+        _skip(session_id, action, "kind not allowed from source", source=source, kind=kind)
+        return None
+    about = item.get("about", "").strip().lower()
+    if about not in VALID_ABOUT:
+        _skip(session_id, action, "invalid about", about=about)
+        return None
+    if source == "agent" and kind == "fact" and about == "user":
+        _skip(session_id, action, "agent claim about the user")
+        return None
+    evidence = item.get("evidence", "")
+    if not _quoted_in(evidence, user_text if source == "user" else agent_text):
+        _skip(session_id, action, f"evidence not in {source} text", evidence=evidence[:80])
+        return None
+    if kind == "assessment" and not _quoted_in(item.get("endorsement", ""), user_text):
+        _skip(session_id, action, "assessment not endorsed by user")
+        return None
     return source, kind
 
 
-def process_knowledge(conn, knowledge_list, session_id=None):
+def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent_text=""):
     """Process extracted knowledge into topics+statements tables.
 
     Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
     Each statement written gets a source, kind and session_id; updating a
     statement replaces them.
+    *user_text* and *agent_text* are the exchange the items came from, used
+    to check each item's evidence.
     Never deletes data — retirement is done via updates, not removal.
     Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
     """
@@ -332,7 +403,7 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id)
+            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -356,7 +427,7 @@ def process_knowledge(conn, knowledge_list, session_id=None):
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id)
+            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -395,7 +466,7 @@ def process_knowledge(conn, knowledge_list, session_id=None):
         if not tags:
             _skip(session_id, action, "missing tags")
             continue
-        provenance = _parse_provenance(item, action, session_id)
+        provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
         if provenance is None:
             continue
 
@@ -655,7 +726,7 @@ def _run(data):
         if cfg["knowledge_extraction"]:
             knowledge = result.get("knowledge", [])
             topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
-                conn, knowledge, session_id
+                conn, knowledge, session_id, user_text or "", agent_text or ""
             )
 
         # Tasks
