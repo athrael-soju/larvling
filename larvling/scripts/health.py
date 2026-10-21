@@ -71,14 +71,10 @@ def clear_failure():
         pass
 
 
-# Larvling's extraction prompt has opened with this in every version. Calls made
-# before extraction stopped saving transcripts left one per call next to the
-# sessions, and those aren't sessions Larvling records.
 _EXTRACTION_PROMPT_START = "Analyze this conversation"
 
 
 def _not_a_session(path):
-    """True for an extraction call's transcript, or one that can't be read."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for _, line in zip(range(50), f):

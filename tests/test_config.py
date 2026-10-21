@@ -61,7 +61,6 @@ class ConfigTest(unittest.TestCase):
 
 
 def fake_sdk(options_seen, version=preflight.MIN_SDK_VERSION):
-    """A stand-in claude_agent_sdk module that records the options call_model builds."""
     class ResultMessage:
         subtype = "success"
         structured_output = {}
@@ -80,8 +79,6 @@ def fake_sdk(options_seen, version=preflight.MIN_SDK_VERSION):
 
 
 class CallModelTest(unittest.TestCase):
-    """call_model hands the configured model to the SDK, apart from the user's setup."""
-
     def setUp(self):
         support.reset_db()
 
@@ -113,8 +110,6 @@ class CallModelTest(unittest.TestCase):
 
 
 class CheckDependenciesTest(unittest.TestCase):
-    """Session start installs a missing or outdated SDK in the background."""
-
     def setUp(self):
         tmp = tempfile.mkdtemp(prefix="larvling-sdk-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -124,7 +119,6 @@ class CheckDependenciesTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def check(self, version):
-        """Run check_dependencies with *version* installed (None: missing)."""
         modules = fake_sdk({}, version) if version else {"claude_agent_sdk": None}
         out = io.StringIO()
         with mock.patch.dict(sys.modules, modules), \
@@ -151,6 +145,8 @@ class CheckDependenciesTest(unittest.TestCase):
         self.assertEqual(started[0][-1], f"claude-agent-sdk>={preflight.MIN_SDK_VERSION}")
         self.assertIn("Installing Dependency", out)
         self.assertIn("0.1.41", out)
+        with open(self.log, encoding="utf-8") as f:
+            self.assertTrue(f.read().startswith("started by "))
 
     def test_a_missing_sdk_is_installed_in_the_background(self):
         ready, started, out = self.check(None)

@@ -1,6 +1,4 @@
-"""Recording health check: which transcripts count as sessions Larvling
-missed.
-"""
+"""Recording health check."""
 
 import contextlib
 import io
@@ -34,7 +32,6 @@ class RecordingGapTest(unittest.TestCase):
         self.write(CURRENT, PROMPT)
 
     def write(self, stem, prompt, entrypoint="cli", recorded=False):
-        """Add a transcript newer than the ones before it."""
         path = os.path.join(self.tdir, stem + ".jsonl")
         turn = {"type": "user", "message": {"role": "user", "content": prompt}}
         if entrypoint:

@@ -11,7 +11,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -418,16 +417,10 @@ def ensure_schema():
 
 
 MIN_SDK_VERSION = "0.2.170"
-# A background install of the SDK for this Python writes pip's output here,
-# then "exit <code>" once pip is done. It belongs to the user's Python
-# environment, not the project, so it lives in the temp directory.
 SDK_INSTALL_LOG = os.path.join(
-    tempfile.gettempdir(),
-    "larvling-sdk-%s.log" % hashlib.sha1(
-        f"{getattr(os, 'getuid', lambda: '')()}:{sys.executable}".encode()
-    ).hexdigest()[:12],
+    os.path.expanduser("~"), ".claude",
+    "larvling-sdk-%s.log" % hashlib.sha1(sys.executable.encode()).hexdigest()[:12],
 )
-# An install without an exit line after this long was killed or has stalled.
 SDK_INSTALL_STALE_SECONDS = 1800
 _PIP_WRAPPER = (
     "import subprocess, sys\n"
@@ -438,7 +431,6 @@ _PIP_WRAPPER = (
 
 
 def sdk_outdated(version):
-    """True if claude-agent-sdk *version* is older than MIN_SDK_VERSION."""
     def parts(v):
         return [int(n) for n in re.findall(r"\d+", v)[:3]]
     return parts(version) < parts(MIN_SDK_VERSION)
@@ -460,13 +452,18 @@ def _read(path):
 
 
 def _install_sdk_in_background(spec):
-    """Start pip in a process that outlives the hook, unless one is running."""
     import subprocess
 
+    new = f"{SDK_INSTALL_LOG}.{os.getpid()}.new"
     try:
-        os.close(os.open(SDK_INSTALL_LOG, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        os.makedirs(os.path.dirname(SDK_INSTALL_LOG), exist_ok=True)
+        with open(os.open(new, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600), "w") as f:
+            f.write(f"started by {os.getpid()} at {time.time()}\n")
+        os.link(new, SDK_INSTALL_LOG)
     except OSError:
-        return  # another session started one first
+        return
+    finally:
+        _remove(new)
     try:
         subprocess.Popen(
             [sys.executable, "-c", _PIP_WRAPPER, SDK_INSTALL_LOG,
@@ -482,15 +479,12 @@ def _install_sdk_in_background(spec):
 
 
 def _claim_retry(previous):
-    """Take the failed install's log, whose text is *previous*, so that only
-    this session starts the next install. False if another session got there
-    first."""
     claimed = f"{SDK_INSTALL_LOG}.{os.getpid()}"
     try:
         os.rename(SDK_INSTALL_LOG, claimed)
     except OSError:
         return False
-    if _read(claimed) != previous:  # another session's new install: put it back
+    if _read(claimed) != previous:
         try:
             os.rename(claimed, SDK_INSTALL_LOG)
         except OSError:
@@ -501,16 +495,11 @@ def _claim_retry(previous):
 
 
 def check_dependencies():
-    """Make sure claude-agent-sdk MIN_SDK_VERSION or later is installed.
-
-    Downloading the SDK takes longer than the SessionStart hook may run, so a
-    missing or outdated SDK is installed in the background, and the next
-    session start says if that failed. Returns True if the SDK is ready.
-    """
+    """Return True if claude-agent-sdk is ready; otherwise install it in the background."""
     try:
         import claude_agent_sdk
         installed = getattr(claude_agent_sdk, "__version__", "")
-    except ImportError:
+    except Exception:
         installed = None
     if installed and not sdk_outdated(installed):
         _remove(SDK_INSTALL_LOG)
