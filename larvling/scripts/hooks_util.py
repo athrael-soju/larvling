@@ -50,6 +50,27 @@ def spawn_detached(script_path, payload_path):
     )
 
 
+def spawn_with_payload(script_path, raw):
+    """Run *script_path* detached with the JSON text *raw* as its payload.
+
+    The payload goes through a temp file, which the child deletes.
+    """
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    )
+    tmp.write(raw)
+    tmp.close()
+    try:
+        spawn_detached(script_path, tmp.name)
+    except Exception:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def run_detached_or_inline(script_path, callback):
     """Handle the detached-process pattern used by slow hooks.
 
@@ -64,8 +85,6 @@ def run_detached_or_inline(script_path, callback):
 
     Handles LARVLING_INTERNAL guard, stdout reconfiguration, and errors.
     """
-    import tempfile
-
     if os.environ.get("LARVLING_INTERNAL"):
         return
     reconfigure_stdout()
@@ -100,18 +119,7 @@ def run_detached_or_inline(script_path, callback):
         if not raw.strip():
             return
 
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, encoding="utf-8"
-        )
-        tmp.write(raw)
-        tmp.close()
-        try:
-            spawn_detached(script_path, tmp.name)
-        except Exception:
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+        spawn_with_payload(script_path, raw)
         return
 
     try:

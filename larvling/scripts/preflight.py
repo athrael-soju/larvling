@@ -140,10 +140,37 @@ def migrate_v13_to_v14(conn):
     return {"statements_attributed": backfill_statement_sessions(conn)}
 
 
+def migrate_v14_to_v15(conn):
+    """v15: track per-session extraction on sessions.
+
+    Earlier versions extracted after every exchange, so every message already
+    recorded counts as extracted.
+    """
+    conn.execute("ALTER TABLE sessions ADD COLUMN extracted_at TEXT")
+    conn.execute("ALTER TABLE sessions ADD COLUMN extracted_through INTEGER")
+    conn.execute("ALTER TABLE sessions ADD COLUMN extract_lease TEXT")
+    cur = conn.execute(
+        """
+        UPDATE sessions SET
+            extracted_through = (
+                SELECT MAX(m.id) FROM messages m
+                WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+            ),
+            extracted_at = datetime('now')
+        WHERE EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+        )
+        """
+    )
+    return {"sessions_marked_extracted": cur.rowcount}
+
+
 # Schema version -> the step that upgrades it by one. Don't change a step
 # after release; add a new one.
 MIGRATIONS = {
     13: migrate_v13_to_v14,
+    14: migrate_v14_to_v15,
 }
 
 

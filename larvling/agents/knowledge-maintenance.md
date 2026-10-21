@@ -22,7 +22,7 @@ SQLite database at `.claude/larvling.db`.
 `tasks.metadata` is an optional JSON object (nullable). When present, carries `{"source_session_id": "<sid>"}` for provenance. Query via `json_extract(metadata, '$.source_session_id')`.
 
 **Sessions schema (read-mostly):**
-- `sessions (id TEXT PK, started_at TEXT, ended_at TEXT, duration_min REAL, title TEXT, agent_summary TEXT, exchange_count INT, summary_at TEXT, summary_msg_count INT, tags TEXT, summary_offered INT)`
+- `sessions (id TEXT PK, started_at TEXT, ended_at TEXT, duration_min REAL, title TEXT, agent_summary TEXT, exchange_count INT, summary_at TEXT, summary_msg_count INT, tags TEXT, summary_offered INT, extracted_at TEXT, extracted_through INT, extract_lease TEXT)`
 
 ## Query Tool
 

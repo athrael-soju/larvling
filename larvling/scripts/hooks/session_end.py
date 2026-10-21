@@ -30,8 +30,11 @@ def handle(data):
         ensure_session(conn, session_id)
         finalize_session(conn, session_id)
 
+        # Words the user added mid-turn are recorded as user messages too, but
+        # they don't start an exchange.
         exchange_count = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user'",
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND COALESCE(json_valid(metadata) AND json_extract(metadata, '$.mid_turn'), 0) = 0",
             (session_id,),
         ).fetchone()[0]
 

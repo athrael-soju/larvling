@@ -1,9 +1,9 @@
 """
-Unified exchange analysis — Stop command hook.
+Session extraction — SessionEnd, PreCompact and SessionStart catch-up.
 
-Reads the transcript, parses the last exchange, calls Sonnet (via sdk.py)
-to identify knowledge, session tags, and tasks in a single
-SDK call, then writes results to SQLite.
+Reads the messages a session recorded since its last extraction, calls the
+model (via sdk.py) to identify knowledge, session tags and tasks, then writes
+the results to SQLite. A long session is extracted in chunks, one call each.
 """
 
 import asyncio
@@ -11,19 +11,18 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 
 from config import get_config
 from db import (
     open_db,
     has_table,
-    ensure_session,
     record_message,
     log,
 )
 from hooks_util import run_detached_or_inline
 from sdk import call_model
-from transcript import parse_last_user_text, parse_last_turn, wait_for_transcript_stable
 
 
 # ---------------------------------------------------------------------------
@@ -60,17 +59,27 @@ ALLOWED_SOURCING = {
 MIN_EVIDENCE_WORDS = 3
 MIN_ENDORSEMENT_WORDS = 2
 
+# Messages per model call are capped by their total length; a longer session
+# is extracted in several chunks. One very long message is cut short in the
+# prompt, so its evidence must come from the part the model saw.
+CHUNK_CHARS = 60000
+MESSAGE_CHARS = 8000
+# A worker holds a session for this long; a crashed worker's claim expires.
+LEASE_MINUTES = 15
+# SessionStart catch-up leaves a session alone until it has been quiet this
+# long, so a session still running in another terminal isn't cut in half.
+CATCH_UP_IDLE_MINUTES = 10
+
 
 # ---------------------------------------------------------------------------
 # Analysis prompt and schema
 # ---------------------------------------------------------------------------
 
 EXTRACTION_PROMPT = """\
-Analyze this conversation exchange and extract structured data.
+Analyze this conversation and extract structured data. {scope} Messages are \
+numbered in order.
 
-USER said: {user_text}
-
-AGENT responded: {agent_text}
+{transcript}
 
 ## Database access
 
@@ -90,7 +99,11 @@ Six tables in 3 parent→child pairs:
 
 ### Phase 1 — Identify candidates
 
-Read the exchange and list what is worth extracting. Do NOT assign actions yet.
+Read the whole conversation and list what is worth extracting. Do NOT assign actions yet.
+
+Later messages can correct earlier ones. When the USER corrects, retracts or changes \
+something later on, extract only the final version: never store a claim the \
+conversation goes on to contradict.
 
 - **Knowledge candidates**: durable facts worth remembering across sessions. \
 Who said it decides whether it can be stored:
@@ -111,11 +124,11 @@ when the USER explicitly agrees with an AGENT judgement, store the judgement as 
 combine: "our CI" says nothing about the size of the user's team.
   - Ask: "Is this useful?" If not, do not include it.
   - Prefer fewer, higher-quality items over many low-value ones.
-- **Task candidates**: durable commitments and TODOs that outlive this exchange, \
-plus progress on — or completion of — existing tasks. If the exchange shows an open \
+- **Task candidates**: durable commitments and TODOs that outlive this conversation, \
+plus progress on — or completion of — existing tasks. If the conversation shows an open \
 task was finished, that is an `update_task → done` candidate; record it so completed \
 work leaves the open list instead of lingering until the next tidy.
-- **Session tags**: topics/themes from this exchange (1-4 words each, max ~8 tags).
+- **Session tags**: topics/themes of this conversation (1-4 words each, max ~8 tags).
 
 ### Phase 2 — Dedup check (mandatory)
 
@@ -128,7 +141,7 @@ to check for overlap — and query ALL statuses, not just open ones \
 `status='dropped'` was deliberately retired, and one with `status='done'` is already \
 complete: treat both as tombstones. If a candidate resembles a dropped or done task, \
 `skip` it — never recreate or reopen retired work unless the user explicitly asked for \
-it again in this exchange.
+it again in this conversation.
 
 For session tags, query the current session's tags:
 `SELECT tags FROM sessions WHERE id = '{session_id}'`
@@ -150,17 +163,17 @@ Based on your query results from Phase 2, assign an action for each candidate.
 Never delete data. To retire knowledge, update the statement or topic instead.
 
 **Task actions:**
-- **add_task**: a durable commitment that outlives this exchange and is not tracked \
+- **add_task**: a durable commitment that outlives this conversation and is not tracked \
 in ANY status — create a new task. Do NOT mint a task for a passing aside or an \
-intention that was already resolved within this same exchange, and never create one \
+intention that was already resolved within this same conversation, and never create one \
 that matches a `dropped` or `done` task (that resurrects retired work — `skip` instead)
 - **add_update**: genuinely new context, progress, or notes about an existing task (include "task_id"). If the same fact is already recorded in updates, skip instead.
 - **update_task**: change status/priority/horizon on an existing task (include "task_id"); also records the reason as an update entry
 - **skip**: task already tracked and no new information — do NOT include it in the output
 
 **Session tags:** return the FULL updated list — merge similar tags, drop tags no longer \
-relevant, and add new tags from this exchange. If current tags is empty, just return \
-new tags from this exchange.
+relevant, and add new tags from this conversation. If current tags is empty, just return \
+new tags from this conversation.
 
 ## Output schema
 
@@ -171,16 +184,17 @@ subject only: a title never makes a claim about the user.
 taken from elsewhere
 - Domains: personal, professional, preferences, interests, knowledge, technical, workflow
 - Tags: short topic label (e.g. "octopuses", "physics", "python")
-- source: whose words the claim comes from: "user" (the USER's message) or "agent" (the AGENT's response)
+- source: whose words the claim comes from: "user" (a USER message) or "agent" (an AGENT message)
 - kind: "fact" (something true: about the user, their work or the people they deal \
 with, or general domain knowledge), "decision" (a choice the user has made), \
 "preference" (how the user likes things done, or their opinion), "assessment" (an \
 AGENT judgement the USER explicitly agreed with — nothing else)
 - about: "user" (the user, their work, or the people they deal with) or "domain" \
 (general knowledge, true no matter who is asking)
-- evidence: a span of at least three words copied word for word from the source's \
-message that supports the claim. Do not paraphrase: an item whose evidence is not in \
-that message, or is shorter than three words, is discarded.
+- evidence: a span of at least three words copied word for word from one of the \
+source's messages that supports the claim. Do not paraphrase or join text from two \
+messages: an item whose evidence is not in one of that speaker's messages, or is \
+shorter than three words, is discarded.
 - endorsement: for kind "assessment" only, the USER's words agreeing with it, at least \
 two words copied word for word; otherwise ""
 - Allowed: source "user" with kind fact, decision or preference; source "agent" with \
@@ -272,12 +286,39 @@ EXTRACTION_SCHEMA = {
 }
 
 
-def build_extraction_prompt(user_text, agent_text, session_id=""):
-    """Format the extraction prompt with the exchange text."""
+_SPEAKERS = {"user": "USER", "assistant": "AGENT"}
+
+
+def format_transcript(messages):
+    """Render (id, role, content) messages as numbered USER/AGENT turns.
+
+    A message over MESSAGE_CHARS is cut short with a note of how much is missing.
+    """
+    lines = []
+    for n, (_, role, content) in enumerate(messages, 1):
+        text = content or ""
+        if len(text) > MESSAGE_CHARS:
+            text = text[:MESSAGE_CHARS] + f" [... {len(text) - MESSAGE_CHARS} more characters]"
+        lines.append(f"[{n}] {_SPEAKERS[role]}: {text}")
+    return "\n\n".join(lines)
+
+
+def build_extraction_prompt(messages, session_id="", part=None):
+    """Format the extraction prompt for *messages*, (id, role, content) tuples.
+
+    *part* is (n, total) when the messages are one chunk of a longer run.
+    """
+    if part and part[1] > 1:
+        scope = (
+            f"It is part {part[0]} of {part[1]} of a long session; the parts are "
+            "extracted in order, so query the database to see what earlier parts stored."
+        )
+    else:
+        scope = "It is a whole session, or the part of it not yet extracted."
     query_script = os.path.join(os.path.dirname(__file__), "query.py")
     return EXTRACTION_PROMPT.format(
-        user_text=user_text,
-        agent_text=agent_text,
+        scope=scope,
+        transcript=format_transcript(messages),
         session_id=session_id or "",
         query_script=query_script.replace("\\", "/"),
         python=os.path.basename(sys.executable),
@@ -350,17 +391,23 @@ def _word_count(text):
     return len(_COUNTED.findall(text)) + letters / _SEA_LETTERS_PER_WORD
 
 
-def _quoted_in(quote, text):
-    """True when *quote* appears word for word in *text*."""
+def _quoted_in(quote, texts):
+    """True when *quote* appears word for word in one of *texts*."""
     words = _words(quote)
-    return bool(words) and f" {words} " in f" {_words(text)} "
+    return bool(words) and any(f" {words} " in f" {_words(t)} " for t in texts)
 
 
-def _parse_provenance(item, action, session_id, user_text, agent_text):
+def _as_list(texts):
+    """Return *texts* as a list: one message (a string) or several."""
+    return [texts] if isinstance(texts, str) else list(texts or [])
+
+
+def _parse_provenance(item, action, session_id, user_texts, agent_texts):
     """Check an item's source, kind and evidence.
 
-    The evidence must appear in the source's message, and an assessment also
-    needs the user's endorsement. Returns (source, kind) or None (with logging).
+    The evidence must appear in one of the source's messages, and an
+    assessment also needs the user's endorsement. Returns (source, kind) or
+    None (with logging).
     """
     source = _field(item, "source").lower()
     if source not in VALID_SOURCE:
@@ -380,10 +427,10 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
     if source == "agent" and kind == "fact" and about == "user":
         _skip(session_id, action, "agent claim about the user")
         return None
-    # These checks prove only that the quotes are in the exchange, not that
+    # These checks prove only that the quotes are in the conversation, not that
     # they support the claim; the minimum length stops a stray word passing.
     evidence = _field(item, "evidence")
-    if not _quoted_in(evidence, user_text if source == "user" else agent_text):
+    if not _quoted_in(evidence, user_texts if source == "user" else agent_texts):
         _skip(session_id, action, f"evidence not in {source} text", evidence=evidence[:80])
         return None
     if _word_count(evidence) < MIN_EVIDENCE_WORDS:
@@ -391,7 +438,7 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
         return None
     if kind == "assessment":
         endorsement = _field(item, "endorsement")
-        if not _quoted_in(endorsement, user_text):
+        if not _quoted_in(endorsement, user_texts):
             _skip(session_id, action, "assessment not endorsed by user")
             return None
         if _word_count(endorsement) < MIN_ENDORSEMENT_WORDS:
@@ -400,19 +447,21 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
     return source, kind
 
 
-def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent_text=""):
+def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agent_texts=()):
     """Process extracted knowledge into topics+statements tables.
 
     Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
     Each statement written gets a source, kind and session_id; updating a
     statement replaces them.
-    *user_text* and *agent_text* are the exchange the items came from, used
-    to check each item's evidence.
+    *user_texts* and *agent_texts* are the messages (a list, or one string)
+    the items came from, used to check each item's evidence.
     Never deletes data — retirement is done via updates, not removal.
     Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
     """
     if not knowledge_list or not has_table(conn, "topics"):
         return 0, 0, 0, 0
+    user_texts = _as_list(user_texts)
+    agent_texts = _as_list(agent_texts)
 
     topics_inserted = 0
     stmts_inserted = 0
@@ -463,7 +512,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
+            provenance = _parse_provenance(item, action, session_id, user_texts, agent_texts)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -487,7 +536,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
             if not claim:
                 _skip(session_id, action, "missing claim")
                 continue
-            provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
+            provenance = _parse_provenance(item, action, session_id, user_texts, agent_texts)
             if provenance is None:
                 continue
             if not conn.execute(
@@ -526,7 +575,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_text="", agent
         if not tags:
             _skip(session_id, action, "missing tags")
             continue
-        provenance = _parse_provenance(item, action, session_id, user_text, agent_text)
+        provenance = _parse_provenance(item, action, session_id, user_texts, agent_texts)
         if provenance is None:
             continue
 
@@ -727,46 +776,205 @@ def store_tags(conn, session_id, tags):
 
 
 # ---------------------------------------------------------------------------
+# Extraction state: which messages are done, and who is working on a session
+# ---------------------------------------------------------------------------
+
+
+def _lease_token():
+    """A lease value: the UTC time it was taken (as datetime('now') writes it) and our pid."""
+    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} {os.getpid()}"
+
+
+def _lease_free(column="extract_lease"):
+    return f"({column} IS NULL OR {column} < datetime('now', '-{LEASE_MINUTES} minutes'))"
+
+
+def claim_session(conn, session_id):
+    """Take the session's extraction lease.
+
+    Returns the lease token, or None if another worker holds a live one.
+    """
+    token = _lease_token()
+    cur = conn.execute(
+        f"UPDATE sessions SET extract_lease = ? WHERE id = ? AND {_lease_free()}",
+        (token, session_id),
+    )
+    conn.commit()
+    return token if cur.rowcount == 1 else None
+
+
+def renew_claim(conn, session_id, token):
+    """Extend a lease we hold. Returns the new token, or None if it was lost."""
+    new = _lease_token()
+    cur = conn.execute(
+        "UPDATE sessions SET extract_lease = ? WHERE id = ? AND extract_lease = ?",
+        (new, session_id, token),
+    )
+    conn.commit()
+    return new if cur.rowcount == 1 else None
+
+
+def release_claim(conn, session_id, token):
+    """Give up a lease we hold."""
+    conn.execute(
+        "UPDATE sessions SET extract_lease = NULL WHERE id = ? AND extract_lease = ?",
+        (session_id, token),
+    )
+    conn.commit()
+
+
+def pending_messages(conn, session_id):
+    """Return the session's user and agent messages not yet extracted.
+
+    Each is an (id, role, content) tuple, oldest first.
+    """
+    return [
+        tuple(r)
+        for r in conn.execute(
+            "SELECT m.id, m.role, m.content FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE m.session_id = ? AND m.role IN ('user', 'assistant') "
+            "AND m.id > COALESCE(s.extracted_through, 0) "
+            "ORDER BY m.id",
+            (session_id,),
+        )
+    ]
+
+
+def pending_sessions(conn, exclude=None, idle_minutes=CATCH_UP_IDLE_MINUTES):
+    """Return the ids of sessions with messages not yet extracted, oldest first.
+
+    Leaves out *exclude* (the session that is starting), sessions with a
+    message in the last *idle_minutes*, and sessions another worker holds.
+    """
+    rows = conn.execute(
+        "SELECT s.id FROM sessions s JOIN messages m ON m.session_id = s.id "
+        "WHERE m.role IN ('user', 'assistant') AND s.id IS NOT ? "
+        f"AND m.id > COALESCE(s.extracted_through, 0) AND {_lease_free('s.extract_lease')} "
+        "GROUP BY s.id HAVING MAX(m.timestamp) < datetime('now', ?) "
+        "ORDER BY MAX(m.id)",
+        (exclude, f"-{idle_minutes} minutes"),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def chunk_messages(messages, budget=None):
+    """Split messages into chunks whose text in the prompt fits *budget*
+    (CHUNK_CHARS by default).
+
+    A chunk that ends on a user message hands it to the next chunk, so a
+    question and its answer stay together.
+    """
+    budget = budget or CHUNK_CHARS
+    chunks, current, size = [], [], 0
+    for message in messages:
+        length = min(len(message[2] or ""), MESSAGE_CHARS)
+        if current and size + length > budget:
+            carry = [current.pop()] if len(current) > 1 and current[-1][1] == "user" else []
+            chunks.append(current)
+            current = carry
+            size = sum(min(len(m[2] or ""), MESSAGE_CHARS) for m in carry)
+        current.append(message)
+        size += length
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
-def _run(data):
-    """Detached worker — called by run_detached_or_inline after payload parsing."""
-    if data.get("stop_hook_active"):
-        return  # Prevent recursive hook firing
+def _summary(parts, empty):
+    return ", ".join(parts) if parts else empty
 
-    cfg = get_config()
-    if not cfg["analysis"]:
-        return
 
-    session_id = data.get("session_id")
-    transcript_path = data.get("transcript_path")
+def _store(session_id, token, chunk, result, cfg):
+    """Write one chunk's results, watermark and system message in one transaction.
 
-    # Wait for transcript to finish writing before parsing
-    wait_for_transcript_stable(transcript_path)
+    Returns the counts written, or None if *token* no longer holds the lease.
+    """
+    user_texts = [content or "" for _, role, content in chunk if role == "user"]
+    agent_texts = [content or "" for _, role, content in chunk if role == "assistant"]
 
-    # Get user text and agent text. A turn the user didn't start (a task
-    # notification) has no user text.
-    user_text = parse_last_user_text(transcript_path) or ""
-    agent_text = parse_last_turn(transcript_path)[0] or ""
+    with open_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT extract_lease FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if not row or row[0] != token:
+            conn.rollback()
+            return None
 
-    if not user_text and not agent_text:
-        log("extraction_skipped", session_id, reason="no text found")
-        return
+        # Knowledge (topics + statements)
+        topics_ins = stmts_ins = stmts_upd = topics_upd = 0
+        if cfg["knowledge_extraction"]:
+            topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
+                conn, result.get("knowledge", []), session_id, user_texts, agent_texts
+            )
 
+        # Tasks
+        tasks_ins = updates_ins = tasks_upd = 0
+        if cfg["task_tracking"]:
+            tasks_ins, updates_ins, tasks_upd = process_tasks(
+                conn, result.get("tasks", []), session_id
+            )
+
+        # Session tags
+        if cfg["session_tags"]:
+            session_tags = result.get("session_tags", [])
+            if isinstance(session_tags, list):
+                store_tags(conn, session_id, session_tags)
+
+        conn.execute(
+            "UPDATE sessions SET extracted_through = ?, extracted_at = datetime('now') "
+            "WHERE id = ?",
+            (chunk[-1][0], session_id),
+        )
+
+        k_parts = []
+        if topics_ins:
+            k_parts.append(f"{topics_ins} topics")
+        if stmts_ins:
+            k_parts.append(f"{stmts_ins} statements")
+        if stmts_upd or topics_upd:
+            k_parts.append(f"{stmts_upd + topics_upd} updated")
+        t_parts = []
+        if tasks_ins:
+            t_parts.append(f"{tasks_ins} tasks")
+        if updates_ins:
+            t_parts.append(f"{updates_ins} updates")
+        if tasks_upd:
+            t_parts.append(f"{tasks_upd} modified")
+        record_message(
+            conn,
+            session_id,
+            "system",
+            f"Extraction: knowledge={_summary(k_parts, 'no changes')}, "
+            f"{_summary(t_parts, 'no tasks')}",
+        )
+    return topics_ins, stmts_ins, stmts_upd, topics_upd, tasks_ins, updates_ins, tasks_upd
+
+
+def extract_chunk(session_id, token, chunk, part, cfg):
+    """Extract one chunk of a session and store the results.
+
+    The results, the session's new watermark and an "Extraction:" system
+    message are written in one transaction, and only while *token* still holds
+    the session's lease. Returns True if they were stored.
+    """
     try:
-        prompt = build_extraction_prompt(user_text, agent_text, session_id)
-        result, usage_info = asyncio.run(
+        result, _ = asyncio.run(
             call_model(
-                prompt,
+                build_extraction_prompt(chunk, session_id, part),
                 allowed_tools=["Bash"],
                 output_format={"type": "json_schema", "schema": EXTRACTION_SCHEMA},
             )
         )
     except Exception as e:
         log("extraction_error", session_id, context="SDK call", error=str(e))
-        return
+        return False
 
     if not isinstance(result, dict):
         log(
@@ -775,60 +983,17 @@ def _run(data):
             context="unexpected type",
             error=str(type(result)),
         )
-        return
+        return False
 
-    with open_db() as conn:
-        # Ensure session row exists before writing session-scoped data
-        if session_id:
-            ensure_session(conn, session_id)
-
-        # Knowledge (topics + statements)
-        topics_ins = stmts_ins = stmts_upd = topics_upd = 0
-        if cfg["knowledge_extraction"]:
-            knowledge = result.get("knowledge", [])
-            topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
-                conn, knowledge, session_id, user_text, agent_text
-            )
-
-        # Tasks
-        tasks_ins = updates_ins = tasks_upd = 0
-        if cfg["task_tracking"]:
-            tasks_list = result.get("tasks", [])
-            tasks_ins, updates_ins, tasks_upd = process_tasks(
-                conn, tasks_list, session_id
-            )
-
-        # Session tags
-        if cfg["session_tags"]:
-            session_tags = result.get("session_tags", [])
-            if session_id and isinstance(session_tags, list):
-                store_tags(conn, session_id, session_tags)
-
-        # Record extraction as a system message
-        if session_id:
-            k_parts = []
-            if topics_ins:
-                k_parts.append(f"{topics_ins} topics")
-            if stmts_ins:
-                k_parts.append(f"{stmts_ins} statements")
-            if stmts_upd or topics_upd:
-                k_parts.append(f"{stmts_upd + topics_upd} updated")
-            k_summary = ", ".join(k_parts) if k_parts else "no changes"
-
-            t_parts = []
-            if tasks_ins:
-                t_parts.append(f"{tasks_ins} tasks")
-            if updates_ins:
-                t_parts.append(f"{updates_ins} updates")
-            if tasks_upd:
-                t_parts.append(f"{tasks_upd} modified")
-            t_summary = ", ".join(t_parts) if t_parts else "no tasks"
-
-            sys_content = f"Extraction: knowledge={k_summary}, {t_summary}"
-            sys_meta = None
-            record_message(conn, session_id, "system", sys_content, sys_meta)
-
-        conn.commit()
+    try:
+        counts = _store(session_id, token, chunk, result, cfg)
+    except Exception as e:
+        log("extraction_error", session_id, context="store", error=str(e))
+        return False
+    if counts is None:
+        log("extraction_skipped", session_id, reason="lease lost")
+        return False
+    topics_ins, stmts_ins, stmts_upd, topics_upd, tasks_ins, updates_ins, tasks_upd = counts
 
     if topics_ins or stmts_ins or stmts_upd or topics_upd:
         k_data = {}
@@ -852,14 +1017,70 @@ def _run(data):
             t_data["tasks_updated"] = tasks_upd
         log("tasks", session_id, **t_data)
 
-    analysis_data = {}
+    analysis_data = {"messages": len(chunk), "part": f"{part[0]}/{part[1]}"}
     if result.get("session_tags"):
         tags = result["session_tags"]
         analysis_data["session_tags"] = tags if isinstance(tags, list) else [tags]
     if result.get("tasks"):
         analysis_data["tasks"] = len(result["tasks"])
-
     log("analysis", session_id, **analysis_data)
+    return True
+
+
+def extract_session(session_id, cfg=None):
+    """Extract every message the session recorded since its last extraction.
+
+    Takes the session's lease first, so two workers never extract the same
+    session at once; messages recorded while it runs are picked up before it
+    lets go. Returns the number of chunks stored.
+    """
+    cfg = cfg or get_config()
+    with open_db() as conn:
+        token = claim_session(conn, session_id)
+    if token is None:
+        log("extraction_skipped", session_id, reason="session already being extracted")
+        return 0
+
+    stored = 0
+    try:
+        while True:
+            with open_db() as conn:
+                messages = pending_messages(conn, session_id)
+            if not messages:
+                return stored
+            chunks = chunk_messages(messages)
+            for n, chunk in enumerate(chunks, 1):
+                with open_db() as conn:
+                    token = renew_claim(conn, session_id, token)
+                if token is None or not extract_chunk(
+                    session_id, token, chunk, (n, len(chunks)), cfg
+                ):
+                    return stored
+                stored += 1
+    finally:
+        if token is not None:
+            with open_db() as conn:
+                release_claim(conn, session_id, token)
+
+
+def _run(data):
+    """Detached worker: extract the hook's session, or catch up earlier ones.
+
+    SessionEnd and PreCompact pass their payload; SessionStart passes
+    ``catch_up`` with the session that is starting, which is left alone.
+    """
+    cfg = get_config()
+    if not cfg["analysis"]:
+        return
+
+    session_id = data.get("session_id")
+    if data.get("catch_up"):
+        with open_db() as conn:
+            pending = pending_sessions(conn, exclude=session_id)
+        for sid in pending:
+            extract_session(sid, cfg)
+    elif session_id:
+        extract_session(session_id, cfg)
 
 
 if __name__ == "__main__":

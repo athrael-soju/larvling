@@ -19,6 +19,7 @@ from db import (
     get_schema_version,
 )
 from health import recording_gap, pending_failure, clear_failure
+from hooks_util import spawn_with_payload
 
 CACHE_PATH = os.path.join(
     os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
@@ -447,6 +448,26 @@ def build_health_banner(payload):
     return "\n".join(lines) if lines else None
 
 
+def start_catch_up(session_id):
+    """Extract earlier sessions that weren't fully extracted, in the background.
+
+    Covers sessions whose SessionEnd never ran (a crash, a closed terminal) or
+    whose extraction failed. The starting session itself is left out.
+    """
+    if not get_config()["analysis"]:
+        return
+    from analyze import pending_sessions
+
+    with open_db() as conn:
+        if not pending_sessions(conn, exclude=session_id):
+            return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analyze.py")
+    spawn_with_payload(
+        os.path.normpath(script),
+        json.dumps({"catch_up": True, "session_id": session_id}),
+    )
+
+
 def main():
     if os.environ.get("LARVLING_INTERNAL"):
         return
@@ -479,6 +500,11 @@ def main():
         print()
 
     print(get_session_context())
+
+    try:
+        start_catch_up((payload or {}).get("session_id"))
+    except Exception:
+        pass  # Catch-up is retried at the next start
 
     update_notice = check_update()
     if update_notice:

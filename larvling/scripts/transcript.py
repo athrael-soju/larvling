@@ -209,14 +209,16 @@ def parse_last_turn(transcript_path):
 
 
 def _last_turn_user_words(lines):
-    """Return (prompt, mid-turn words) for the last turn of transcript *lines*.
+    """Return (prompt, by_user, mid-turn words) for the last turn of transcript *lines*.
 
-    *prompt* is the text that started the turn if the user wrote it, else None.
+    *prompt* is the text that started the turn, and *by_user* whether the
+    user wrote it.
     """
     start, entry = _last_turn_start(lines)
     if entry is None:
-        return None, []
-    prompt = _message_text(entry) if is_real_user_message(entry) else None
+        return None, False, []
+    prompt = _message_text(entry)
+    by_user = is_real_user_message(entry)
 
     words = []
     tool_names = {}
@@ -234,36 +236,23 @@ def _last_turn_user_words(lines):
                     tool_names[block.get("id")] = block.get("name")
             continue
         for text in _mid_turn_words(later, tool_names):
-            if text != prompt and text not in words:
+            if not (by_user and text == prompt) and text not in words:
                 words.append(text)
-    return prompt, words
+    return prompt, by_user, words
 
 
-def parse_mid_turn_user_texts(transcript_path):
-    """Return what the user wrote during the last turn, after the prompt that started it.
+def parse_user_turn(transcript_path):
+    """Return (prompt, by_user, mid_turn) for the last turn.
 
-    A list of texts, oldest first: messages they queued while the agent
-    worked, their AskUserQuestion answers, and feedback on rejected tool calls.
+    *prompt* is the text that started it, and *by_user* is False when Claude
+    Code or an agent wrote it, such as a task notification or a scheduled
+    prompt. *mid_turn* lists what the user wrote while the turn ran, oldest
+    first: messages they queued, their AskUserQuestion answers and feedback on
+    rejected tool calls. Returns (None, False, []) if there is no turn.
     """
     if not transcript_path or not os.path.exists(transcript_path):
-        return []
-    return _last_turn_user_words(_read_transcript_lines(transcript_path))[1]
-
-
-def parse_last_user_text(transcript_path):
-    """Return everything the user wrote in the last turn.
-
-    That is the prompt that started it, if the user wrote it, and what they
-    added while it ran (see parse_mid_turn_user_texts). Returns None when the
-    user wrote nothing, e.g. a turn started by a task notification. The user's
-    earlier messages belong to earlier turns, so they aren't used.
-    """
-    if not transcript_path or not os.path.exists(transcript_path):
-        return None
-
-    prompt, words = _last_turn_user_words(_read_transcript_lines(transcript_path))
-    texts = ([prompt] if prompt else []) + words
-    return "\n\n".join(texts) if texts else None
+        return None, False, []
+    return _last_turn_user_words(_read_transcript_lines(transcript_path))
 
 
 def wait_for_transcript_stable(transcript_path, interval=0.1, max_wait=2):
