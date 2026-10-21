@@ -448,11 +448,12 @@ def build_health_banner(payload):
     return "\n".join(lines) if lines else None
 
 
-def start_catch_up(session_id):
+def start_catch_up(session_id, transcript_path=None):
     """Extract earlier sessions that weren't fully extracted, in the background.
 
     Covers sessions whose SessionEnd never ran (a crash, a closed terminal) or
-    whose extraction failed. The starting session itself is left out.
+    whose extraction failed. The starting session itself is left out. The
+    worker finds the other sessions' transcripts next to *transcript_path*.
     """
     if not get_config()["analysis"]:
         return
@@ -464,7 +465,9 @@ def start_catch_up(session_id):
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analyze.py")
     spawn_with_payload(
         os.path.normpath(script),
-        json.dumps({"catch_up": True, "session_id": session_id}),
+        json.dumps(
+            {"catch_up": True, "session_id": session_id, "transcript_path": transcript_path}
+        ),
     )
 
 
@@ -502,7 +505,7 @@ def main():
     print(get_session_context())
 
     try:
-        start_catch_up((payload or {}).get("session_id"))
+        start_catch_up((payload or {}).get("session_id"), (payload or {}).get("transcript_path"))
     except Exception:
         pass  # Catch-up is retried at the next start
 
