@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.35](https://github.com/athrael-soju/larvling/compare/v0.1.34...v0.1.35) (2026-10-21)
+
+
+### Features
+
+* Phase 1 extraction integrity ([#83](https://github.com/athrael-soju/larvling/issues/83)) ([2397d13](https://github.com/athrael-soju/larvling/commit/2397d1375375d50d993c38ec95c285ec85cb133d))
+
 ## [0.1.34](https://github.com/athrael-soju/larvling/compare/v0.1.33...v0.1.34) (2026-06-24)
 
 
