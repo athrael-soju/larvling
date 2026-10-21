@@ -71,6 +71,28 @@ def clear_failure():
         pass
 
 
+_EXTRACTION_PROMPT_START = "Analyze this conversation"
+
+
+def _not_a_session(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(50), f):
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") != "user":
+                        continue
+                    content = entry["message"]["content"]
+                except (ValueError, AttributeError, KeyError, TypeError):
+                    continue
+                if isinstance(content, list):
+                    content = next((b.get("text", "") for b in content if isinstance(b, dict)), "")
+                return str(content).startswith(_EXTRACTION_PROMPT_START)
+    except OSError:
+        return True
+    return False
+
+
 def recording_gap(conn, payload):
     """Count recent sessions Claude Code recorded that Larvling did not.
 
@@ -111,7 +133,7 @@ def recording_gap(conn, payload):
             continue
         if st.st_size < _SUBSTANTIAL_BYTES:
             continue
-        entries.append((st.st_mtime, stem))
+        entries.append((st.st_mtime, stem, full))
 
     if not entries:
         return 0
@@ -126,9 +148,10 @@ def recording_gap(conn, payload):
     # that starts at the most recent session means recording is broken *now*;
     # older gaps (pre-install, a one-off empty session) stop the count early.
     missing = 0
-    for _, stem in entries[:_HEALTH_WINDOW]:
-        if stem in recorded:
+    for _, stem, full in entries:
+        if stem in recorded or missing >= _HEALTH_WINDOW:
             break
-        missing += 1
+        if not _not_a_session(full):
+            missing += 1
 
     return missing if missing >= _GAP_THRESHOLD else 0

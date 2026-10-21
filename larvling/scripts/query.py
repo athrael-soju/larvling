@@ -14,7 +14,6 @@ invites summarizing a partial result, so we error instead of trimming.
 """
 
 import json
-import os
 import sys
 
 from db import open_db, require_db, reconfigure_stdout

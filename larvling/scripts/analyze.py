@@ -1100,24 +1100,15 @@ def extract_chunk(session_id, token, chunk, part, cfg):
             "SELECT date(timestamp, 'localtime') FROM messages WHERE id = ?", (chunk[0][0],)
         ).fetchone()[0]
     try:
-        result, _ = asyncio.run(
+        result = asyncio.run(
             call_model(
                 build_extraction_prompt(chunk, session_id, part, day),
+                schema=EXTRACTION_SCHEMA,
                 allowed_tools=["Bash"],
-                output_format={"type": "json_schema", "schema": EXTRACTION_SCHEMA},
             )
         )
     except Exception as e:
         log("extraction_error", session_id, context="SDK call", error=str(e))
-        return False
-
-    if not isinstance(result, dict):
-        log(
-            "extraction_error",
-            session_id,
-            context="unexpected type",
-            error=str(type(result)),
-        )
         return False
 
     try:

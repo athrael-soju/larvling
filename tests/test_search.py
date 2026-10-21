@@ -309,7 +309,8 @@ class WithoutFts5Test(unittest.TestCase):
 
     def test_a_fresh_install_works_without_fts5(self):
         support.reset_db()
-        with mock.patch.object(db, "_fts5", False):
+        with mock.patch.object(db, "_fts5", False), \
+                mock.patch.object(preflight, "check_dependencies", return_value=True):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 preflight.main()

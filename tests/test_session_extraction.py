@@ -68,7 +68,7 @@ class FakeModel:
         if self.error:
             raise self.error
         result = self.results.pop(0) if self.results else {}
-        return {"knowledge": [], "session_tags": [], "tasks": [], **result}, None
+        return {"knowledge": [], "session_tags": [], "tasks": [], **result}
 
 
 def fresh_db():

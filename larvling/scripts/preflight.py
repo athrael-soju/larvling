@@ -6,7 +6,9 @@ prints both schemas for the agent to migrate.
 """
 
 import bisect
+import hashlib
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -414,21 +416,94 @@ def ensure_schema():
     return "migrate"
 
 
-def check_dependencies():
-    """Check if required Python packages are installed.
+MIN_SDK_VERSION = "0.2.170"
+SDK_INSTALL_LOG = os.path.join(
+    os.path.expanduser("~"), ".claude",
+    "larvling-sdk-%s.log" % hashlib.sha1(sys.executable.encode()).hexdigest()[:12],
+)
+SDK_INSTALL_STALE_SECONDS = 1800
+_PIP_WRAPPER = (
+    "import subprocess, sys\n"
+    "with open(sys.argv[1], 'a') as log:\n"
+    "    code = subprocess.run(sys.argv[2:], stdout=log, stderr=log).returncode\n"
+    "    log.write(f'\\nexit {code}\\n')\n"
+)
 
-    Auto-installs from requirements.txt if missing.
-    Returns True if all dependencies are satisfied, False otherwise.
-    """
+
+def sdk_outdated(version):
+    def parts(v):
+        return [int(n) for n in re.findall(r"\d+", v)[:3]]
+    return parts(version) < parts(MIN_SDK_VERSION)
+
+
+def _remove(path):
     try:
-        import claude_agent_sdk  # noqa: F401
-        return True
-    except ImportError:
+        os.remove(path)
+    except OSError:
         pass
 
-    # Auto-install missing dependency
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    req_file = os.path.join(plugin_root, "requirements.txt") if plugin_root else ""
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _install_sdk_in_background(spec):
+    import subprocess
+
+    new = f"{SDK_INSTALL_LOG}.{os.getpid()}.new"
+    try:
+        os.makedirs(os.path.dirname(SDK_INSTALL_LOG), exist_ok=True)
+        with open(os.open(new, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600), "w") as f:
+            f.write(f"started by {os.getpid()} at {time.time()}\n")
+        os.link(new, SDK_INSTALL_LOG)
+    except OSError:
+        return
+    finally:
+        _remove(new)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _PIP_WRAPPER, SDK_INSTALL_LOG,
+             sys.executable, "-m", "pip", "install", "--quiet", spec],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError:
+        _remove(SDK_INSTALL_LOG)
+
+
+def _claim_retry(previous):
+    claimed = f"{SDK_INSTALL_LOG}.{os.getpid()}"
+    try:
+        os.rename(SDK_INSTALL_LOG, claimed)
+    except OSError:
+        return False
+    if _read(claimed) != previous:
+        try:
+            os.rename(claimed, SDK_INSTALL_LOG)
+        except OSError:
+            pass
+        return False
+    _remove(claimed)
+    return True
+
+
+def check_dependencies():
+    """Return True if claude-agent-sdk is ready; otherwise install it in the background."""
+    try:
+        import claude_agent_sdk
+        installed = getattr(claude_agent_sdk, "__version__", "")
+    except Exception:
+        installed = None
+    if installed and not sdk_outdated(installed):
+        _remove(SDK_INSTALL_LOG)
+        return True
 
     if sys.version_info < (3, 10):
         print("# Larvling - Python Version Too Old\n")
@@ -437,38 +512,38 @@ def check_dependencies():
         print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
         return False
 
-    import subprocess
+    spec = f"claude-agent-sdk>={MIN_SDK_VERSION}"
+    state = f"{installed}, older than {MIN_SDK_VERSION}" if installed else "missing"
+    previous = _read(SDK_INSTALL_LOG)
     try:
-        cmd = [sys.executable, "-m", "pip", "install", "--quiet"]
-        if req_file and os.path.isfile(req_file):
-            cmd += ["-r", req_file]
-        else:
-            cmd += ["claude-agent-sdk"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
-    except subprocess.CalledProcessError as e:
-        print("# Larvling - Missing Dependency\n")
-        print("`claude-agent-sdk` could not be auto-installed. Install it manually:\n")
-        print("```bash")
-        print(f"{sys.executable} -m pip install claude-agent-sdk")
-        print("```\n")
-        if e.stderr:
-            print(f"Error: {e.stderr.strip()}\n")
-        print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
-        return False
+        fresh = time.time() - os.path.getmtime(SDK_INSTALL_LOG) < SDK_INSTALL_STALE_SECONDS
+    except OSError:
+        fresh = False
+    running = previous is not None and "\nexit " not in previous and fresh
 
-    # Verify import after install
-    try:
-        import claude_agent_sdk  # noqa: F401
-        return True
-    except ImportError:
-        print("# Larvling - Missing Dependency\n")
-        print("`claude-agent-sdk` was installed but cannot be imported. Try manually:\n")
-        print("```bash")
-        print(f"{sys.executable} -m pip install claude-agent-sdk")
-        print("```\n")
+    if running:
+        print("# Larvling - Installing Dependency\n")
+        print(f"`claude-agent-sdk` is {state} and is being installed in the background. "
+              "Knowledge extraction, session tags, and task tracking resume once it is done.")
         return False
+    if previous is not None:
+        print("# Larvling - Missing Dependency\n")
+        print(f"`claude-agent-sdk` is {state}, and installing it in the background failed. "
+              "Larvling is trying again; to install it yourself, run:\n")
+        print("```bash")
+        print(f"{sys.executable} -m pip install --upgrade '{spec}'")
+        print("```\n")
+        tail = previous.strip().splitlines()[-6:]
+        if tail:
+            print("pip's last output:\n```\n" + "\n".join(tail) + "\n```\n")
+        if not _claim_retry(previous):
+            return False
+    else:
+        print("# Larvling - Installing Dependency\n")
+        print(f"`claude-agent-sdk` is {state}; installing it in the background. "
+              "Knowledge extraction, session tags, and task tracking start once it is done.")
+    _install_sdk_in_background(spec)
+    return False
 
 
 def main():
