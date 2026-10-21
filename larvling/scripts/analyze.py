@@ -107,6 +107,8 @@ are not knowledge: drop them, however plausible.
 recommendation, that is the user's decision (source "user", kind "decision"). Only \
 when the USER explicitly agrees with an AGENT judgement, store the judgement as kind \
 "assessment" with the user's words of agreement as "endorsement".
+  - A claim says what its evidence says and no more. Do not infer, generalise or \
+combine: "our CI" says nothing about the size of the user's team.
   - Ask: "Is this useful?" If not, do not include it.
   - Prefer fewer, higher-quality items over many low-value ones.
 - **Task candidates**: durable commitments and TODOs that outlive this exchange, \
@@ -163,6 +165,10 @@ new tags from this exchange.
 ## Output schema
 
 Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "about": "user|domain", "evidence": "...", "endorsement": "...", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+- topic_title: the subject in a few words (e.g. "CI pipeline", "Octopuses"). Name the \
+subject only: a title never makes a claim about the user.
+- claim: only what the evidence says, with no inference, generalisation or detail \
+taken from elsewhere
 - Domains: personal, professional, preferences, interests, knowledge, technical, workflow
 - Tags: short topic label (e.g. "octopuses", "physics", "python")
 - source: whose words the claim comes from: "user" (the USER's message) or "agent" (the AGENT's response)
@@ -320,7 +326,8 @@ _WORD = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+(?:'[^\\W{_UNSPACED}]+)*")
 
 def _words(text):
     """Return the lowercase words of *text*, ignoring punctuation and spacing."""
-    return " ".join(_WORD.findall(unicodedata.normalize("NFKC", text or "").casefold()))
+    text = unicodedata.normalize("NFKC", text or "").casefold().replace("\u2019", "'")
+    return " ".join(_WORD.findall(text))
 
 
 def _quoted_in(quote, text):
