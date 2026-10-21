@@ -489,6 +489,25 @@ class MigrationTest(unittest.TestCase):
         with db.open_db() as conn:
             self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
 
+    def test_a_prompt_recorded_before_the_last_marker_is_still_extracted(self):
+        # Old code wrote exchange 1's marker after prompt 2 was recorded, and
+        # exchange 2 never got its own.
+        support.reset_db()
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        make_v13_db(messages=[
+            ("sess-a", now, "user", "I live in Lisbon"),
+            ("sess-a", now, "assistant", "Noted."),
+            ("sess-a", now, "user", "I work at a bank."),
+            ("sess-a", now, "system", MARKER),
+            ("sess-a", now, "assistant", "Noted too."),
+        ])
+        self.assertEqual(run_preflight()[0], "migrated")
+        model = FakeModel()
+        extract(model, {"session_id": "sess-a", "hook_event_name": "SessionEnd"})
+        self.assertIn("[1] USER: I work at a bank.", model.prompts[0])
+        self.assertIn("[2] AGENT: Noted too.", model.prompts[0])
+        self.assertNotIn("Lisbon", model.prompts[0])
+
     def test_a_session_another_terminal_migrated_under_is_still_extracted(self):
         self.busy_start_db()
         self.assertEqual(run_preflight()[0], "migrated")
