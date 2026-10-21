@@ -91,9 +91,10 @@ class RecordingGapTest(unittest.TestCase):
     def test_an_unreadable_transcript_is_skipped(self):
         self.write("s1", PROMPT, recorded=True)
         self.write("lost-1", PROMPT)
-        os.chmod(self.write("locked", PROMPT), 0)
         self.write("lost-2", PROMPT)
+        os.mkdir(os.path.join(self.tdir, "folder.jsonl"))
         self.assertEqual(self.gap(), 2)
+        self.assertTrue(health._not_a_session(os.path.join(self.tdir, "gone.jsonl")))
 
 
 if __name__ == "__main__":

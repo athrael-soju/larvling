@@ -179,6 +179,41 @@ class CheckDependenciesTest(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertIn("Missing Dependency", out)
 
+    def test_a_failed_start_leaves_no_log(self):
+        with mock.patch.dict(sys.modules, fake_sdk({}, "0.1.41")), \
+                mock.patch("subprocess.Popen", side_effect=OSError("no python")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(preflight.check_dependencies())
+        self.assertFalse(os.path.exists(self.log))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_the_log_is_private(self):
+        self.check("0.1.41")
+        self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+
+    def test_a_retry_another_session_claimed_is_left_to_it(self):
+        self.write_log("ERROR: no matching distribution\nexit 1\n")
+        with mock.patch("os.rename", side_effect=FileNotFoundError):
+            ready, started, out = self.check("0.1.41")
+        self.assertEqual(started, [])
+        self.assertIn("Missing Dependency", out)
+
+    def test_another_sessions_new_install_is_not_taken_over(self):
+        self.write_log("ERROR: no matching distribution\nexit 1\n")
+        rename = os.rename
+
+        def claim_after_a_new_install_began(src, dst):
+            rename(src, dst)
+            if dst != self.log:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write("Collecting claude-agent-sdk\n")
+
+        with mock.patch("os.rename", side_effect=claim_after_a_new_install_began):
+            ready, started, out = self.check("0.1.41")
+        self.assertEqual(started, [])
+        with open(self.log, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "Collecting claude-agent-sdk\n")
+
     def test_the_background_process_logs_its_exit_code(self):
         subprocess.run([sys.executable, "-c", preflight._PIP_WRAPPER, self.log,
                         sys.executable, "-c", "print('pip output')"], check=True)

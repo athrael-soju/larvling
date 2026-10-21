@@ -419,11 +419,13 @@ def ensure_schema():
 
 MIN_SDK_VERSION = "0.2.170"
 # A background install of the SDK for this Python writes pip's output here,
-# then "exit <code>" once pip is done. It belongs to the Python environment,
-# not the project, so it lives in the temp directory.
+# then "exit <code>" once pip is done. It belongs to the user's Python
+# environment, not the project, so it lives in the temp directory.
 SDK_INSTALL_LOG = os.path.join(
     tempfile.gettempdir(),
-    "larvling-sdk-%s.log" % hashlib.sha1(sys.executable.encode()).hexdigest()[:12],
+    "larvling-sdk-%s.log" % hashlib.sha1(
+        f"{getattr(os, 'getuid', lambda: '')()}:{sys.executable}".encode()
+    ).hexdigest()[:12],
 )
 # An install without an exit line after this long was killed or has stalled.
 SDK_INSTALL_STALE_SECONDS = 1800
@@ -442,23 +444,60 @@ def sdk_outdated(version):
     return parts(version) < parts(MIN_SDK_VERSION)
 
 
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def _install_sdk_in_background(spec):
     """Start pip in a process that outlives the hook, unless one is running."""
     import subprocess
 
     try:
-        os.close(os.open(SDK_INSTALL_LOG, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except FileExistsError:
+        os.close(os.open(SDK_INSTALL_LOG, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except OSError:
         return  # another session started one first
-    subprocess.Popen(
-        [sys.executable, "-c", _PIP_WRAPPER, SDK_INSTALL_LOG,
-         sys.executable, "-m", "pip", "install", "--quiet", spec],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        start_new_session=(os.name != "nt"),
-    )
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _PIP_WRAPPER, SDK_INSTALL_LOG,
+             sys.executable, "-m", "pip", "install", "--quiet", spec],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError:
+        _remove(SDK_INSTALL_LOG)
+
+
+def _claim_retry(previous):
+    """Take the failed install's log, whose text is *previous*, so that only
+    this session starts the next install. False if another session got there
+    first."""
+    claimed = f"{SDK_INSTALL_LOG}.{os.getpid()}"
+    try:
+        os.rename(SDK_INSTALL_LOG, claimed)
+    except OSError:
+        return False
+    if _read(claimed) != previous:  # another session's new install: put it back
+        try:
+            os.rename(claimed, SDK_INSTALL_LOG)
+        except OSError:
+            pass
+        return False
+    _remove(claimed)
+    return True
 
 
 def check_dependencies():
@@ -474,8 +513,7 @@ def check_dependencies():
     except ImportError:
         installed = None
     if installed and not sdk_outdated(installed):
-        if os.path.exists(SDK_INSTALL_LOG):
-            os.remove(SDK_INSTALL_LOG)
+        _remove(SDK_INSTALL_LOG)
         return True
 
     if sys.version_info < (3, 10):
@@ -487,13 +525,12 @@ def check_dependencies():
 
     spec = f"claude-agent-sdk>={MIN_SDK_VERSION}"
     state = f"{installed}, older than {MIN_SDK_VERSION}" if installed else "missing"
+    previous = _read(SDK_INSTALL_LOG)
     try:
-        with open(SDK_INSTALL_LOG, encoding="utf-8", errors="replace") as f:
-            previous = f.read()
-        running = ("\nexit " not in previous and
-                   time.time() - os.path.getmtime(SDK_INSTALL_LOG) < SDK_INSTALL_STALE_SECONDS)
+        fresh = time.time() - os.path.getmtime(SDK_INSTALL_LOG) < SDK_INSTALL_STALE_SECONDS
     except OSError:
-        previous, running = None, False
+        fresh = False
+    running = previous is not None and "\nexit " not in previous and fresh
 
     if running:
         print("# Larvling - Installing Dependency\n")
@@ -510,7 +547,8 @@ def check_dependencies():
         tail = previous.strip().splitlines()[-6:]
         if tail:
             print("pip's last output:\n```\n" + "\n".join(tail) + "\n```\n")
-        os.remove(SDK_INSTALL_LOG)
+        if not _claim_retry(previous):
+            return False
     else:
         print("# Larvling - Installing Dependency\n")
         print(f"`claude-agent-sdk` is {state}; installing it in the background. "
