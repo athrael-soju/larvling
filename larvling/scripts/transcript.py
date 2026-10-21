@@ -2,7 +2,18 @@
 
 import json
 import os
+import re
 import time
+
+
+def strip_ide_tags(text):
+    """Remove leading IDE context tags (opened files, selections) prepended by VSCode."""
+    return re.sub(
+        r"^(?:<ide_(?:opened_file|selection)>.*?</ide_(?:opened_file|selection)>\s*)+",
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
 
 
 def starts_turn(entry):
@@ -49,7 +60,8 @@ def is_real_user_message(entry):
 def agent_prompts(transcript_path):
     """Return the texts of the prompts in the transcript that Claude Code or an
     agent wrote (see is_real_user_message), leaving out any text the user also
-    sent as a prompt of their own."""
+    sent as a prompt of their own. Texts are as the prompt hook stores them,
+    without IDE tags."""
     if not transcript_path or not os.path.exists(transcript_path):
         return set()
     agent, user = set(), set()
@@ -62,7 +74,7 @@ def agent_prompts(transcript_path):
             continue
         if not isinstance(entry, dict) or not starts_turn(entry):
             continue
-        text = _message_text(entry).strip()
+        text = strip_ide_tags(_message_text(entry))
         if text:
             (user if is_real_user_message(entry) else agent).add(text)
     return agent - user

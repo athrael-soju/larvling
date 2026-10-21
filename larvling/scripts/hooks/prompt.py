@@ -17,16 +17,7 @@ from db import (
 )
 from health import record_failure, pending_failure, clear_failure
 from hooks_util import read_hook_payload
-
-
-def strip_ide_tags(text):
-    """Remove leading IDE context tags (opened files, selections) prepended by VSCode."""
-    return re.sub(
-        r"^(?:<ide_(?:opened_file|selection)>.*?</ide_(?:opened_file|selection)>\s*)+",
-        "",
-        text,
-        flags=re.DOTALL,
-    ).strip()
+from transcript import strip_ide_tags
 
 
 def _last_context_counts():
