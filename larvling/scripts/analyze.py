@@ -134,8 +134,8 @@ work leaves the open list instead of lingering until the next tidy.
 
 ### Phase 2 — Dedup check (mandatory)
 
-For EACH knowledge candidate, run at least one query against topics and statements \
-to check for overlap. Use LIKE queries on title and claim columns.
+For EACH knowledge candidate, run at least one query against topics and \
+current_statements to check for overlap. Use LIKE queries on title and claim columns.
 
 For EACH task candidate, run at least one query against tasks and their updates \
 to check for overlap — and query ALL statuses, not just open ones \
@@ -532,15 +532,25 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 continue
             if old["claim"] == claim:
                 continue
-            cur = conn.execute(
-                "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (old["topic_id"], claim, *provenance, session_id),
-            )
+            # The new claim may already be current (a legacy correction stored
+            # next to what it corrects): point at it instead of a second copy.
+            existing = conn.execute(
+                "SELECT id FROM current_statements WHERE claim = ? AND id != ? "
+                "ORDER BY id DESC LIMIT 1",
+                (claim, stmt_id),
+            ).fetchone()
+            if existing:
+                new_id = existing["id"]
+            else:
+                new_id = conn.execute(
+                    "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (old["topic_id"], claim, *provenance, session_id),
+                ).lastrowid
             conn.execute(
                 "UPDATE statements SET superseded_by = ?, superseded_at = datetime('now') "
                 "WHERE id = ?",
-                (cur.lastrowid, stmt_id),
+                (new_id, stmt_id),
             )
             stmts_superseded += 1
             continue

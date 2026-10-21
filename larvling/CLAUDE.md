@@ -50,10 +50,11 @@ A backup of the database has already been created.
    - `BEGIN TRANSACTION`
    - `CREATE TABLE <new_table> (...)` with the correct schema
    - `INSERT INTO <new_table> SELECT ... FROM <old_table>`
+   - `DROP VIEW` every view that reads the old table (e.g. `current_statements` reads `statements`) — otherwise the rename fails with `error in view ...: no such table`
    - `DROP TABLE <old_table>`
    - `ALTER TABLE <new_table> RENAME TO <old_table>`
    - Rebuild **every table** that has a FK referencing the rebuilt table (same pattern)
-   - Rebuild any indexes/triggers on affected tables
+   - Rebuild any indexes/triggers on affected tables, and recreate the dropped views from the desired schema
    - `PRAGMA foreign_key_check` — must return zero rows
    - `COMMIT`
    - `PRAGMA foreign_keys = ON`

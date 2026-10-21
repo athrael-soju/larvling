@@ -10,6 +10,7 @@ import io
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import unittest
 
@@ -141,6 +142,125 @@ class SupersedeTest(unittest.TestCase):
     def test_superseded_by_must_name_a_statement(self):
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("UPDATE statements SET superseded_by = 99 WHERE id = 1")
+
+    def test_superseding_into_a_claim_already_current_points_at_it(self):
+        # A legacy correction stored next to the claim it corrects.
+        self.conn.execute(
+            "INSERT INTO statements (id, topic_id, claim, source, kind) "
+            "VALUES (2, 1, 'Production database is PostgreSQL 15', 'user', 'fact')"
+        )
+        self.assertEqual(self.supersede(), (0, 0, 1, 0))
+        self.assertEqual(self.current(), [(2, 1, "Production database is PostgreSQL 15")])
+        self.assertEqual(self.conn.execute(
+            "SELECT superseded_by FROM statements WHERE id = 1").fetchone()[0], 2)
+
+
+PLUGIN_DIR = os.path.join(support.SCRIPTS_DIR, "..")
+
+
+def recipe(path, start):
+    """The SQL in *path* (relative to the plugin) that starts with *start*,
+    from inline code or a code block, as the agent would copy it."""
+    with open(os.path.join(PLUGIN_DIR, path), encoding="utf-8") as f:
+        text = f.read()
+    for sql in re.findall(r"`([^`\n]+)`", text) + [line.strip() for line in text.splitlines()]:
+        if sql.startswith(start):
+            return sql.strip().rstrip(";")
+    raise AssertionError(f"no recipe starting {start!r} in {path}")
+
+
+def fill(sql, **values):
+    for name, value in values.items():
+        pattern = r"\bN\b" if name == "N" else re.escape(f"<{name}>")
+        sql = re.sub(pattern, lambda _: str(value), sql)
+    return sql
+
+
+def run_query(sql):
+    """Run *sql* through query.py, a connection of its own, as the agent does."""
+    out = subprocess.run(
+        [sys.executable, os.path.join(support.SCRIPTS_DIR, "query.py"), sql],
+        capture_output=True, text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": support.PROJECT_DIR},
+    )
+    if out.returncode:
+        raise AssertionError(out.stderr)
+    match = re.match(r"(-?\d+) row\(s\) affected", out.stdout)
+    return int(match.group(1)) if match else out.stdout
+
+
+class RecipesTest(unittest.TestCase):
+    """The SQL the skills and the maintenance agent tell the model to run."""
+
+    def setUp(self):
+        fresh_db().close()
+
+    def query(self, sql, *args):
+        conn = db.get_db()
+        try:
+            return [tuple(r) for r in conn.execute(sql, args)]
+        finally:
+            conn.close()
+
+    def add(self, sid, claim):
+        run_query(f"INSERT INTO statements (id, topic_id, claim, source, kind) "
+                  f"VALUES ({sid}, 1, '{claim}', 'manual', 'fact')")
+
+    def test_remember_supersedes_once_and_only_onto_a_stored_statement(self):
+        update = recipe("skills/remember/SKILL.md", "UPDATE statements SET superseded_by")
+        self.add(2, "Production database is PostgreSQL")
+        self.assertEqual(run_query(fill(update, N=1).replace("'...'", "'Production database is PostgreSQL'")), 1)
+        self.add(3, "Production database is MariaDB")
+        # Already superseded: the 1 -> 2 link stays.
+        self.assertEqual(run_query(fill(update, N=1).replace("'...'", "'Production database is MariaDB'")), 0)
+        # The replacement was never stored: nothing is retired.
+        self.assertEqual(run_query(fill(update, N=3).replace("'...'", "'Not stored'")), 0)
+        self.assertEqual(self.query("SELECT id, superseded_by FROM statements WHERE id IN (1, 3)"),
+                         [(1, 2), (3, None)])
+
+    def test_tidy_correction_is_manual_in_this_session_and_guarded(self):
+        insert = recipe("agents/knowledge-maintenance.md", "INSERT INTO statements")
+        update = recipe("agents/knowledge-maintenance.md",
+                        "UPDATE statements SET superseded_by = (SELECT MAX(id)")
+        values = {"old_id": 1, "session id": SID}
+        claim = "Production database is PostgreSQL"
+        run_query(fill(insert, **values).replace("<corrected claim>", claim))
+        self.assertEqual(run_query(fill(update, **values).replace("<corrected claim>", claim)), 1)
+        self.assertEqual(self.query("SELECT claim, source, session_id FROM current_statements"),
+                         [(claim, "manual", SID)])
+        # Run again: the old statement is already superseded.
+        run_query(fill(insert, **values).replace("<corrected claim>", "Another claim"))
+        self.assertEqual(run_query(fill(update, **values).replace("<corrected claim>", "Another claim")), 0)
+        self.assertEqual(self.query("SELECT superseded_by FROM statements WHERE id = 1"), [(2,)])
+
+    def test_tidy_duplicates_cannot_supersede_each_other(self):
+        dup = recipe("agents/knowledge-maintenance.md",
+                     "UPDATE statements SET superseded_by = <survivor_id>")
+        self.add(2, "Production DB is MySQL")
+        self.assertEqual(run_query(fill(dup, survivor_id=2, duplicate_id=1)), 1)
+        self.assertEqual(run_query(fill(dup, survivor_id=1, duplicate_id=2)), 0)
+        self.assertEqual(run_query(fill(dup, survivor_id=2, duplicate_id=2)), 0)
+        self.assertEqual(self.query("SELECT id FROM current_statements"), [(2,)])
+
+    def test_tidy_retire_leaves_a_superseded_statement_alone(self):
+        retire = recipe("agents/knowledge-maintenance.md", "UPDATE statements SET superseded_at")
+        self.add(2, "Production database is PostgreSQL")
+        run_query("UPDATE statements SET superseded_by = 2, superseded_at = '2026-01-01 00:00:00' WHERE id = 1")
+        self.assertEqual(run_query(fill(retire, id=1)), 0)
+        self.assertEqual(run_query(fill(retire, id=2)), 1)
+        self.assertEqual(self.query("SELECT id, superseded_by, superseded_at FROM statements WHERE id = 1"),
+                         [(1, 2, "2026-01-01 00:00:00")])
+
+    def test_forget_finds_every_earlier_version(self):
+        older = recipe("skills/forget/SKILL.md", "WITH RECURSIVE older")
+        self.add(2, "Production database is PostgreSQL")
+        self.add(3, "Production database is PostgreSQL 15")
+        run_query("UPDATE statements SET superseded_by = id + 1, superseded_at = datetime('now') WHERE id < 3")
+        found = run_query(fill(older, N=3) + " ORDER BY s.id")
+        self.assertIn("Production database is MySQL", found)
+        self.assertIn("Production database is PostgreSQL ", found)
+        self.assertIn("(2 rows)", found)
+        run_query("DELETE FROM statements WHERE id IN (3, 2, 1)")
+        self.assertEqual(self.query("SELECT COUNT(*) FROM statements"), [(0,)])
 
 
 class ReadersTest(unittest.TestCase):
