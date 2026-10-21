@@ -199,6 +199,22 @@ class SourcingRulesTest(unittest.TestCase):
             1,
         )
 
+    def test_any_apostrophe_matches_and_splits_words_for_matching(self):
+        user = "Iʼm on my team‘s CI rota. L'équipe ships on Fridays."
+        quotes = [
+            item(claim="Is on a CI rota", evidence="I'm on my team"),
+            item(claim="Team ships on Fridays", evidence="équipe ships on Fridays"),
+        ]
+        self.assertEqual(len(self.stored(quotes, user, "")), 2)
+
+    def test_thai_evidence_needs_about_three_words(self):
+        # One common word ("ที่") is three code points but one letter.
+        user = "ที่ทำงานเราใช้ Python ทุกวัน"
+        too_short = item(claim="Uses Python", evidence="ที่")
+        self.assertEqual(self.stored([too_short], user, ""), [])
+        enough = item(claim="Uses Python daily at work", evidence="ที่ทำงานเราใช้ Python ทุกวัน")
+        self.assertEqual(len(self.stored([enough], user, "")), 1)
+
     def test_evidence_in_thai_is_matched_mid_clause(self):
         user = "ฉันชอบใช้ Python มากกว่า Java ในงาน"
         preference = item(claim="Prefers Python to Java", kind="preference",

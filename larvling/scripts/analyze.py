@@ -312,22 +312,42 @@ def _field(item, key):
 
 
 # Kana, CJK ideographs, Thai, Lao, Khmer and Myanmar are written without spaces
-# between words, so each character counts as a word; otherwise a whole clause
-# would be one word.
-_UNSPACED = (
+# between words, so quotes in them are matched character by character;
+# otherwise a whole clause would be one word.
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana, CJK
+_SEA = (
     "\u0e00-\u0eff"  # Thai, Lao
     "\u1000-\u109f\ua9e0-\ua9ff\uaa60-\uaa7f"  # Myanmar
     "\u1780-\u17ff\u19e0-\u19ff"  # Khmer
-    "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana, CJK
 )
-# A contraction ("I'm", "don't") is one word.
-_WORD = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+(?:'[^\\W{_UNSPACED}]+)*")
+_UNSPACED = _CJK + _SEA
+# An apostrophe splits a word for matching, so "my team" is found in "my
+# team's CI"; for counting, a contraction ("I'm", "don't") is one word.
+_TOKEN = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+")
+_COUNTED = re.compile(f"[{_CJK}]|[^\\W{_UNSPACED}]+(?:'[^\\W{_UNSPACED}]+)*")
+_SEA_LETTER = re.compile(f"[{_SEA}]")
+# A CJK character is about a word; in Thai, Lao, Khmer and Myanmar a word is
+# several letters, vowel and tone marks aside.
+_SEA_LETTERS_PER_WORD = 3
+_APOSTROPHES = str.maketrans({c: "'" for c in "\u2018\u2019\u02bc`"})
+
+
+def _normalize(text):
+    return unicodedata.normalize("NFKC", text or "").casefold().translate(_APOSTROPHES)
 
 
 def _words(text):
     """Return the lowercase words of *text*, ignoring punctuation and spacing."""
-    text = unicodedata.normalize("NFKC", text or "").casefold().replace("\u2019", "'")
-    return " ".join(_WORD.findall(text))
+    return " ".join(_TOKEN.findall(_normalize(text)))
+
+
+def _word_count(text):
+    """Roughly how many words *text* has (see _COUNTED and _SEA_LETTERS_PER_WORD)."""
+    text = _normalize(text)
+    letters = sum(
+        1 for c in _SEA_LETTER.findall(text) if not unicodedata.category(c).startswith("M")
+    )
+    return len(_COUNTED.findall(text)) + letters / _SEA_LETTERS_PER_WORD
 
 
 def _quoted_in(quote, text):
@@ -366,7 +386,7 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
     if not _quoted_in(evidence, user_text if source == "user" else agent_text):
         _skip(session_id, action, f"evidence not in {source} text", evidence=evidence[:80])
         return None
-    if len(_words(evidence).split()) < MIN_EVIDENCE_WORDS:
+    if _word_count(evidence) < MIN_EVIDENCE_WORDS:
         _skip(session_id, action, "evidence too short", evidence=evidence[:80])
         return None
     if kind == "assessment":
@@ -374,7 +394,7 @@ def _parse_provenance(item, action, session_id, user_text, agent_text):
         if not _quoted_in(endorsement, user_text):
             _skip(session_id, action, "assessment not endorsed by user")
             return None
-        if len(_words(endorsement).split()) < MIN_ENDORSEMENT_WORDS:
+        if _word_count(endorsement) < MIN_ENDORSEMENT_WORDS:
             _skip(session_id, action, "endorsement too short", endorsement=endorsement[:80])
             return None
     return source, kind
