@@ -56,12 +56,11 @@ class ConfigTest(unittest.TestCase):
         self.assertIs(cfg["geolocation"], True)
 
 
-def fake_sdk(options_seen, version=sdk.MIN_SDK_VERSION):
+def fake_sdk(options_seen, version=preflight.MIN_SDK_VERSION):
     """A stand-in claude_agent_sdk module that records the options call_model builds."""
     class ResultMessage:
         subtype = "success"
-        structured_output = None
-        usage = None
+        structured_output = {}
 
     async def query(prompt, options):
         yield ResultMessage()
@@ -82,10 +81,10 @@ class CallModelTest(unittest.TestCase):
     def setUp(self):
         support.reset_db()
 
-    def options(self, version=sdk.MIN_SDK_VERSION, **kwargs):
+    def options(self, **kwargs):
         seen = {}
-        with mock.patch.dict(sys.modules, fake_sdk(seen, version)):
-            asyncio.run(sdk.call_model("hello", **kwargs))
+        with mock.patch.dict(sys.modules, fake_sdk(seen)):
+            asyncio.run(sdk.call_model("hello", {"type": "object"}, **kwargs))
         return seen
 
     def test_default_is_the_sonnet_alias(self):
@@ -102,25 +101,10 @@ class CallModelTest(unittest.TestCase):
         self.assertIn("no-session-persistence", seen["extra_args"])
         self.assertEqual(seen["tools"], ["Bash"])
         self.assertEqual(seen["allowed_tools"], ["Bash"])
+        self.assertEqual(seen["env"], {"LARVLING_INTERNAL": "1"})
 
     def test_a_call_without_tools_is_offered_none(self):
         self.assertEqual(self.options()["tools"], [])
-
-    def test_an_outdated_sdk_is_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "older than " + sdk.MIN_SDK_VERSION):
-            self.options(version="0.1.41")
-
-    def test_versions_compare_by_number(self):
-        self.assertFalse(sdk.sdk_outdated(sdk.MIN_SDK_VERSION))
-        self.assertFalse(sdk.sdk_outdated("0.10.0"))
-        self.assertFalse(sdk.sdk_outdated("1.0"))
-        self.assertTrue(sdk.sdk_outdated("0.2.99"))
-        self.assertTrue(sdk.sdk_outdated("unknown"))
-
-    def test_requirements_ask_for_the_minimum_version(self):
-        path = os.path.join(support.SCRIPTS_DIR, "..", "requirements.txt")
-        with open(path, encoding="utf-8") as f:
-            self.assertIn(f"claude-agent-sdk>={sdk.MIN_SDK_VERSION}", f.read().split())
 
 
 class CheckDependenciesTest(unittest.TestCase):
@@ -135,13 +119,25 @@ class CheckDependenciesTest(unittest.TestCase):
         return [c.args[0] for c in run.call_args_list]
 
     def test_a_current_sdk_is_left_alone(self):
-        self.assertEqual(self.pip_calls(sdk.MIN_SDK_VERSION), [])
+        self.assertEqual(self.pip_calls(preflight.MIN_SDK_VERSION), [])
 
     def test_an_outdated_sdk_is_upgraded(self):
         calls = self.pip_calls("0.1.41")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1:4], ["-m", "pip", "install"])
-        self.assertIn(f"claude-agent-sdk>={sdk.MIN_SDK_VERSION}", calls[0])
+        self.assertIn(f"claude-agent-sdk>={preflight.MIN_SDK_VERSION}", calls[0])
+
+    def test_versions_compare_by_number(self):
+        self.assertFalse(preflight.sdk_outdated(preflight.MIN_SDK_VERSION))
+        self.assertFalse(preflight.sdk_outdated("0.10.0"))
+        self.assertFalse(preflight.sdk_outdated("1.0"))
+        self.assertTrue(preflight.sdk_outdated("0.2.99"))
+        self.assertTrue(preflight.sdk_outdated("unknown"))
+
+    def test_requirements_ask_for_the_minimum_version(self):
+        path = os.path.join(support.SCRIPTS_DIR, "..", "requirements.txt")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn(f"claude-agent-sdk>={preflight.MIN_SDK_VERSION}", f.read().split())
 
 
 if __name__ == "__main__":

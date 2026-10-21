@@ -7,6 +7,7 @@ prints both schemas for the agent to migrate.
 
 import bisect
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -29,7 +30,6 @@ from db import (
     fts5_available,
     fts_in_step,
 )
-from sdk import MIN_SDK_VERSION, sdk_outdated
 
 
 # ---------------------------------------------------------------------------
@@ -415,24 +415,28 @@ def ensure_schema():
     return "migrate"
 
 
-def check_dependencies():
-    """Check if required Python packages are installed.
+MIN_SDK_VERSION = "0.2.170"
 
-    Auto-installs from requirements.txt if missing, or upgrades
-    claude-agent-sdk if it is older than MIN_SDK_VERSION.
-    Returns True if all dependencies are satisfied, False otherwise.
+
+def sdk_outdated(version):
+    """True if claude-agent-sdk *version* is older than MIN_SDK_VERSION."""
+    def parts(v):
+        return [int(n) for n in re.findall(r"\d+", v)[:3]]
+    return parts(version) < parts(MIN_SDK_VERSION)
+
+
+def check_dependencies():
+    """Install claude-agent-sdk, or upgrade it to MIN_SDK_VERSION, if needed.
+
+    Returns False, after telling the user how to install it, if that fails.
     """
     try:
         import claude_agent_sdk
-        outdated = claude_agent_sdk.__version__
-        if not sdk_outdated(outdated):
-            return True
+        installed = claude_agent_sdk.__version__
     except ImportError:
-        outdated = None
-
-    # Auto-install missing dependency
-    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
-    req_file = os.path.join(plugin_root, "requirements.txt") if plugin_root else ""
+        installed = None
+    if installed and not sdk_outdated(installed):
+        return True
 
     if sys.version_info < (3, 10):
         print("# Larvling - Python Version Too Old\n")
@@ -442,44 +446,21 @@ def check_dependencies():
         return False
 
     import subprocess
-    try:
-        cmd = [sys.executable, "-m", "pip", "install", "--quiet"]
-        if req_file and os.path.isfile(req_file):
-            cmd += ["-r", req_file]
-        else:
-            cmd += [f"claude-agent-sdk>={MIN_SDK_VERSION}"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
-    except subprocess.CalledProcessError as e:
-        if outdated:
-            print("# Larvling - Outdated Dependency\n")
-            print(f"`claude-agent-sdk` {outdated} is older than {MIN_SDK_VERSION} and could "
-                  "not be upgraded automatically. Upgrade it manually:\n")
-        else:
-            print("# Larvling - Missing Dependency\n")
-            print("`claude-agent-sdk` could not be auto-installed. Install it manually:\n")
-        print("```bash")
-        print(f"{sys.executable} -m pip install --upgrade 'claude-agent-sdk>={MIN_SDK_VERSION}'")
-        print("```\n")
-        if e.stderr:
-            print(f"Error: {e.stderr.strip()}\n")
-        print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
-        return False
-
-    # Verify import after install
-    if outdated:
-        return True  # this process keeps the old module; the next one loads the new
-    try:
-        import claude_agent_sdk  # noqa: F401
+    spec = f"claude-agent-sdk>={MIN_SDK_VERSION}"
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", spec],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
         return True
-    except ImportError:
-        print("# Larvling - Missing Dependency\n")
-        print("`claude-agent-sdk` was installed but cannot be imported. Try manually:\n")
-        print("```bash")
-        print(f"{sys.executable} -m pip install claude-agent-sdk")
-        print("```\n")
-        return False
+    state = f"{installed} is older than {MIN_SDK_VERSION}" if installed else "is missing"
+    print("# Larvling - Missing Dependency\n")
+    print(f"`claude-agent-sdk` {state} and could not be installed automatically. Install it manually:\n")
+    print("```bash")
+    print(f"{sys.executable} -m pip install --upgrade '{spec}'")
+    print("```\n")
+    if result.stderr:
+        print(f"Error: {result.stderr.strip()}\n")
+    print("Without it, knowledge extraction, session tags, and task tracking are disabled.")
+    return False
 
 
 def main():

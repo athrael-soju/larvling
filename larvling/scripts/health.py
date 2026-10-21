@@ -33,29 +33,6 @@ _HEALTH_WINDOW = 15
 # Two-in-a-row avoids crying wolf over a single fluke (e.g. a session that
 # crashed before its Stop hook fired).
 _GAP_THRESHOLD = 2
-# Extraction calls the model through the Agent SDK, and each call leaves a
-# transcript in the same directory, named by an entrypoint like "sdk-py". Those
-# sessions are never recorded, and since extraction runs after a session ends
-# they are often the newest transcripts, so the check skips them.
-_SDK_ENTRYPOINT = "sdk"
-# A transcript names its entrypoint within its first few entries.
-_ENTRYPOINT_LINES = 50
-
-
-def _written_by_sdk(path):
-    """True if the transcript at *path* is from an Agent SDK session."""
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for _, line in zip(range(_ENTRYPOINT_LINES), f):
-                try:
-                    entrypoint = json.loads(line).get("entrypoint")
-                except (ValueError, AttributeError):
-                    continue
-                if entrypoint:
-                    return str(entrypoint).startswith(_SDK_ENTRYPOINT)
-    except OSError:
-        pass
-    return False
 
 
 def record_failure(stage, error):
@@ -94,6 +71,21 @@ def clear_failure():
         pass
 
 
+# A transcript names how it was started ("cli", "sdk-py", ...) within its first
+# few entries. Agent SDK sessions, such as extraction's before it stopped saving
+# transcripts, are never recorded, so the check skips them.
+def _written_by_sdk(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for _, line in zip(range(50), f):
+            try:
+                entrypoint = json.loads(line).get("entrypoint")
+            except (ValueError, AttributeError):
+                continue
+            if entrypoint:
+                return entrypoint.startswith("sdk")
+    return False
+
+
 def recording_gap(conn, payload):
     """Count recent sessions Claude Code recorded that Larvling did not.
 
@@ -101,8 +93,7 @@ def recording_gap(conn, payload):
     payload's ``transcript_path``), which is written for every session whether
     or not Larvling's hooks ran. Returns the number of consecutive most-recent
     substantial sessions missing from Larvling's DB, or 0 when there is no
-    trustworthy signal — so it never cries wolf. Transcripts left by
-    extraction's own model calls aren't sessions, so they are skipped.
+    trustworthy signal — so it never cries wolf.
     """
     transcript_path = (payload or {}).get("transcript_path")
     session_id = (payload or {}).get("session_id")

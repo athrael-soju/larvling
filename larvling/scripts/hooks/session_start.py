@@ -295,7 +295,7 @@ def get_session_context():
 
         # Maintenance hint for large knowledge bases
         if topic_count >= 50 or stmt_count >= 100:
-            lines.append(f"## Maintenance Suggested")
+            lines.append("## Maintenance Suggested")
             lines.append(
                 f"Knowledge base is large ({topic_count} topics, {stmt_count} statements) "
                 "and may benefit from consolidation."

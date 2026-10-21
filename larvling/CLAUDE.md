@@ -262,7 +262,7 @@ $PY "${CLAUDE_PLUGIN_ROOT}/scripts/query.py" "<SQL>"
 
 ## Troubleshooting
 
-**`claude_agent_sdk is required but not installed`** or **`... is older than ...`** — On new installs, or when the installed SDK is too old, `preflight.py` installs or upgrades it, and prints instructions if that fails. Run the `pip install` command shown in the SessionStart context. Without it, knowledge extraction, session tags, and task tracking are disabled (basic session logging still works).
+**Larvling - Missing Dependency** — `preflight.py` installs `claude-agent-sdk` at session start when it is missing, or upgrades it when it is older than Larvling needs, and prints this with a `pip install` command if that fails. Run the command. Without it, knowledge extraction, session tags, and task tracking are disabled (basic session logging still works).
 
 **`python: command not found`** — Larvling requires Python 3.10+. Use the discovery pattern from the "Running Python Scripts" section above. Ensure at least `python3` (Unix) or `python` (Windows) is on the system PATH.
 
