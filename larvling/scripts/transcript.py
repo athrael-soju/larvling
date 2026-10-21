@@ -61,6 +61,72 @@ def _message_text(entry):
     return ""
 
 
+def _block_text(content):
+    """Return the text of a string or a list of content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("text")
+        )
+    return ""
+
+
+# Claude Code's tool_result when the user rejects a tool call and says why.
+_REJECTION = "The user doesn't want to"
+_REJECTION_FEEDBACK = "the user said:"
+
+
+def _mid_turn_words(entry, tool_names):
+    """Return what the user wrote in *entry*, an entry inside a running turn.
+
+    That is a message they queued while the agent worked, their answers to
+    AskUserQuestion (not the questions, which the agent wrote), or what they
+    said when rejecting a tool call. *tool_names* maps tool_use ids to names.
+    """
+    if entry.get("isMeta"):
+        return []
+    if entry.get("type") == "attachment":
+        att = entry.get("attachment")
+        if not isinstance(att, dict) or att.get("type") != "queued_command":
+            return []
+        origin = att.get("origin")
+        if att.get("isMeta") or not isinstance(origin, dict) or origin.get("kind") != "human":
+            return []  # a task notification or another session's message
+        text = _block_text(att.get("prompt")).strip()
+        return [text] if text else []
+    if entry.get("type") != "user":
+        return []
+
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return []
+    words = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        result = _block_text(block.get("content"))
+        if result.startswith(_REJECTION) and _REJECTION_FEEDBACK in result:
+            feedback = result.split(_REJECTION_FEEDBACK, 1)[1].strip()
+            if feedback:
+                words.append(feedback)
+        elif tool_names.get(block.get("tool_use_id")) == "AskUserQuestion":
+            answered = entry.get("toolUseResult")
+            if not isinstance(answered, dict):
+                continue
+            answers = answered.get("answers")
+            notes = answered.get("annotations")
+            for question, answer in (answers.items() if isinstance(answers, dict) else ()):
+                if isinstance(answer, str) and answer.strip():
+                    words.append(answer.strip())
+                note = notes.get(question) if isinstance(notes, dict) else None
+                note = note.get("notes") if isinstance(note, dict) else None
+                if isinstance(note, str) and note.strip():
+                    words.append(note.strip())
+    return words
+
+
 def _read_transcript_lines(transcript_path):
     """Read non-empty stripped lines from a transcript file."""
     lines = []
@@ -133,19 +199,62 @@ def parse_last_turn(transcript_path):
     return text, tools
 
 
-def parse_last_user_text(transcript_path):
-    """Return the text the user wrote to start the last turn.
+def _last_turn_user_words(lines):
+    """Return (prompt, mid-turn words) for the last turn of transcript *lines*.
 
-    Returns None when something else started it, such as a task notification.
-    The user's earlier message belongs to an earlier turn, so it isn't used.
+    *prompt* is the text that started the turn if the user wrote it, else None.
+    """
+    start, entry = _last_turn_start(lines)
+    if entry is None:
+        return None, []
+    prompt = _message_text(entry) if is_real_user_message(entry) else None
+
+    words = []
+    tool_names = {}
+    for line in lines[start + 1:]:
+        try:
+            later = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(later, dict):
+            continue
+        if later.get("type") == "assistant":
+            msg = later.get("message", {})
+            for block in (msg.get("content") if isinstance(msg, dict) else None) or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_names[block.get("id")] = block.get("name")
+            continue
+        for text in _mid_turn_words(later, tool_names):
+            if text != prompt and text not in words:
+                words.append(text)
+    return prompt, words
+
+
+def parse_mid_turn_user_texts(transcript_path):
+    """Return what the user wrote during the last turn, after the prompt that started it.
+
+    A list of texts, oldest first: messages they queued while the agent
+    worked, their AskUserQuestion answers, and feedback on rejected tool calls.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+    return _last_turn_user_words(_read_transcript_lines(transcript_path))[1]
+
+
+def parse_last_user_text(transcript_path):
+    """Return everything the user wrote in the last turn.
+
+    That is the prompt that started it, if the user wrote it, and what they
+    added while it ran (see parse_mid_turn_user_texts). Returns None when the
+    user wrote nothing, e.g. a turn started by a task notification. The user's
+    earlier messages belong to earlier turns, so they aren't used.
     """
     if not transcript_path or not os.path.exists(transcript_path):
         return None
 
-    _, entry = _last_turn_start(_read_transcript_lines(transcript_path))
-    if entry is None or not is_real_user_message(entry):
-        return None
-    return _message_text(entry)
+    prompt, words = _last_turn_user_words(_read_transcript_lines(transcript_path))
+    texts = ([prompt] if prompt else []) + words
+    return "\n\n".join(texts) if texts else None
 
 
 def wait_for_transcript_stable(transcript_path, interval=0.1, max_wait=2):
