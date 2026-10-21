@@ -131,13 +131,19 @@ def set_schema_version(conn, version=SCHEMA_VERSION):
     conn.execute(f"PRAGMA user_version = {int(version)}")
 
 
+# Tables FTS5 creates and manages for each index; never created by hand.
+FTS_SHADOW_SUFFIXES = ("data", "idx", "content", "docsize", "config")
+
+
 def get_current_schema(conn):
-    """Read the live schema from sqlite_master."""
+    """Read the live schema from sqlite_master, leaving out FTS5's own tables."""
     rows = conn.execute(
-        "SELECT sql FROM sqlite_master "
+        "SELECT name, sql FROM sqlite_master "
         "WHERE type IN ('table', 'index', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    return "\n".join(row[0] + ";" for row in rows if row[0])
+    virtual = [r[0] for r in rows if r[1] and r[1].upper().startswith("CREATE VIRTUAL TABLE")]
+    shadow = {f"{v}_{suffix}" for v in virtual for suffix in FTS_SHADOW_SUFFIXES}
+    return "\n".join(r[1] + ";" for r in rows if r[1] and r[0] not in shadow)
 
 
 def get_desired_schema():
@@ -218,14 +224,23 @@ def _fts_triggers(conn):
 
 
 def fts_in_step(conn):
-    """True if the search index matches what this SQLite build supports."""
+    """True if the search index matches what this SQLite build supports, and
+    holds every statement and task (a migration done by hand creates it empty)."""
     if not fts5_available():
         return not _fts_triggers(conn)
-    return (
+    if not (
         has_table(conn, "statements_fts")
         and has_table(conn, "tasks_fts")
         and _fts_triggers(conn) == set(FTS_TRIGGERS)
-    )
+    ):
+        return False
+    try:
+        return conn.execute(
+            "SELECT (SELECT COUNT(*) FROM statements_fts) = (SELECT COUNT(*) FROM statements) "
+            "AND (SELECT COUNT(*) FROM tasks_fts) = (SELECT COUNT(*) FROM tasks)"
+        ).fetchone()[0] == 1
+    except sqlite3.OperationalError:
+        return False
 
 
 def ensure_fts(conn):
@@ -240,8 +255,11 @@ def ensure_fts(conn):
     if fts_in_step(conn):
         return fts5_available()
     if not fts5_available():
-        for name in _fts_triggers(conn):
+        dropped = sorted(_fts_triggers(conn))
+        for name in dropped:
             conn.execute(f"DROP TRIGGER {name}")
+        if dropped:
+            log("fts_triggers_dropped", reason="no FTS5 in this SQLite", triggers=len(dropped))
         return False
     for sql in FTS_TABLES:
         conn.execute(sql)

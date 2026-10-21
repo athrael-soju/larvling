@@ -26,9 +26,21 @@ STOPWORDS = {
     "i", "in", "is", "it", "its", "my", "of", "on", "or", "our", "so", "that", "the",
     "their", "this", "to", "was", "we", "were", "with", "you", "your",
 }
+# A search uses at most this many words, each cut to MAX_TERM_CHARS.
 MAX_TERMS = 16
+MAX_TERM_CHARS = 200
 # Most similar existing rows compared when checking for a duplicate.
 DUPLICATE_CANDIDATES = 5
+# A text with this many words the other lacks says something more: a long
+# claim with a fact added at the end isn't a duplicate of the claim.
+NEW_WORDS = 3
+# Words that change what a text says when only one of two texts has them.
+NEGATION = re.compile(r"\b(?:not|no|never|none|nor|cannot|without)\b|n['\u2019]t\b", re.I)
+DATE_WORDS = {
+    "january", "february", "march", "april", "june", "july", "august", "september",
+    "october", "november", "december", "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday", "today", "tomorrow", "yesterday",
+}
 
 
 def words(text):
@@ -36,13 +48,18 @@ def words(text):
     unless nothing else is left."""
     found = re.findall(r"\w+", (text or "").lower())
     kept = [w for w in found if w not in STOPWORDS] or found
-    return list(dict.fromkeys(kept))[:MAX_TERMS]
+    return list(dict.fromkeys(kept))
+
+
+def terms(text):
+    """The words of *text* a search looks for."""
+    return [w[:MAX_TERM_CHARS] for w in words(text)[:MAX_TERMS]]
 
 
 def fts_query(text):
     """Return an FTS5 query matching any word of *text*, or None if it has none."""
-    terms = words(text)
-    return " OR ".join(f'"{t}"' for t in terms) if terms else None
+    found = terms(text)
+    return " OR ".join(f'"{t}"' for t in found) if found else None
 
 
 def _stem(word):
@@ -68,6 +85,30 @@ def similarity(a, b):
     return len(sa & sb) / len(sa | sb) if sa and sb else 0.0
 
 
+def _names(text):
+    """Stems of the words of *text* capitalised mid-sentence: names, mostly."""
+    found = set()
+    for sentence in re.split(r"[.!?:;\n]+", text or ""):
+        for word in re.findall(r"\w+", sentence)[1:]:
+            if word[0].isupper():
+                found.add(_stem(word.lower()))
+    return found
+
+
+def differ_in_kind(a, b):
+    """True if a word only one of *a* and *b* has changes what it says: a
+    number, a date, a name, or a negation. "Pay the March invoice" and "Pay the
+    April invoice" overlap a lot, but aren't the same task."""
+    if bool(NEGATION.search(a or "")) != bool(NEGATION.search(b or "")):
+        return True
+    sa = {_stem(w) for w in words(a)}
+    sb = {_stem(w) for w in words(b)}
+    only = sa ^ sb
+    if any(any(c.isdigit() for c in w) or w in DATE_WORDS for w in only):
+        return True
+    return bool(only & ((_names(a) - sb) | (_names(b) - sa)))
+
+
 def _like_hits(columns, terms):
     """SQL counting how many *terms* match any of *columns*, and its parameters."""
     match = " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in columns)
@@ -80,16 +121,20 @@ def _fts_ready(conn, table):
     return fts5_available() and has_table(conn, table)
 
 
-def search_statements(conn, text, limit=20, assessments=False):
+def search_statements(conn, text, limit=20, assessments=False, topic_id=None):
     """Return current statements matching *text*, best match first.
 
     Each row has id, topic_id, topic, domain, claim and kind. Assessments are
-    left out unless *assessments* is true.
+    left out unless *assessments* is true; *topic_id* keeps to one topic.
     """
     query = fts_query(text)
     if not query:
         return []
-    kind = "" if assessments else "AND s.kind IS NOT 'assessment'"
+    where = "" if assessments else "AND s.kind IS NOT 'assessment' "
+    extra = ()
+    if topic_id is not None:
+        where += "AND s.topic_id = ? "
+        extra = (topic_id,)
     if _fts_ready(conn, "statements_fts"):
         try:
             return conn.execute(
@@ -97,18 +142,18 @@ def search_statements(conn, text, limit=20, assessments=False):
                 "FROM statements_fts "
                 "JOIN current_statements s ON s.id = statements_fts.rowid "
                 "JOIN topics t ON t.id = s.topic_id "
-                f"WHERE statements_fts MATCH ? {kind} "
+                f"WHERE statements_fts MATCH ? {where}"
                 "ORDER BY bm25(statements_fts, 1.0, 0.5) LIMIT ?",
-                (query, limit),
+                (query, *extra, limit),
             ).fetchall()
         except sqlite3.OperationalError:
             pass  # index unreadable: fall back to LIKE
-    hits, params = _like_hits(("s.claim", "t.title"), words(text))
+    hits, params = _like_hits(("s.claim", "t.title"), terms(text))
     return conn.execute(
         "SELECT s.id, s.topic_id, t.title AS topic, t.domain, s.claim, s.kind "
         "FROM current_statements s JOIN topics t ON t.id = s.topic_id "
-        f"WHERE {hits} > 0 {kind} ORDER BY {hits} DESC, s.id DESC LIMIT ?",
-        (*params, *params, limit),
+        f"WHERE {hits} > 0 {where}ORDER BY {hits} DESC, s.id DESC LIMIT ?",
+        (*params, *extra, *params, limit),
     ).fetchall()
 
 
@@ -130,7 +175,7 @@ def search_tasks(conn, text, limit=20):
             ).fetchall()
         except sqlite3.OperationalError:
             pass
-    hits, params = _like_hits(("t.title",), words(text))
+    hits, params = _like_hits(("t.title",), terms(text))
     return conn.execute(
         "SELECT t.id, t.title, t.status, t.priority, t.horizon FROM tasks t "
         f"WHERE {hits} > 0 ORDER BY {hits} DESC, t.id DESC LIMIT ?",
@@ -138,22 +183,34 @@ def search_tasks(conn, text, limit=20):
     ).fetchall()
 
 
+def adds_words(text, other):
+    """True if *text* has NEW_WORDS or more words that *other* lacks."""
+    return len({_stem(w) for w in words(text)} - {_stem(w) for w in words(other)}) >= NEW_WORDS
+
+
 def near_duplicate(rows, text, field, threshold):
     """Return the row among *rows* whose *field* is most similar to *text*, if
-    that similarity reaches *threshold* (0 < threshold <= 1); else None."""
+    that similarity reaches *threshold* (0 < threshold <= 1), *text* adds
+    fewer than NEW_WORDS words to it, and they don't differ in a number, date,
+    name or negation; else None."""
     if not 0 < threshold <= 1:
         return None
     best, score = None, 0.0
     for row in rows:
+        if differ_in_kind(text, row[field]) or adds_words(text, row[field]):
+            continue
         s = similarity(text, row[field])
         if s > score:
             best, score = row, s
     return best if score >= threshold else None
 
 
-def duplicate_statement(conn, claim, threshold):
-    """Return the current statement *claim* rewords, or None."""
-    rows = search_statements(conn, claim, DUPLICATE_CANDIDATES, assessments=True)
+def duplicate_statement(conn, claim, threshold, topic_id=None):
+    """Return the current statement *claim* rewords, or None; under
+    *topic_id* only, when given."""
+    rows = search_statements(
+        conn, claim, DUPLICATE_CANDIDATES, assessments=True, topic_id=topic_id
+    )
     return near_duplicate(rows, claim, "claim", threshold)
 
 
@@ -178,7 +235,9 @@ def main():
         try:
             limit = int(args[i + 1])
         except (IndexError, ValueError):
-            print("--limit needs a number", file=sys.stderr)
+            limit = 0
+        if limit < 1:
+            print("--limit needs a number of at least 1", file=sys.stderr)
             sys.exit(1)
         args = args[:i] + args[i + 2:]
     text = " ".join(a for a in args if not a.startswith("--"))

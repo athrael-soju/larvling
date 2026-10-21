@@ -157,7 +157,8 @@ which covers ALL statuses, not just open ones) and query the updates of any matc
 `status='dropped'` was deliberately retired, and one with `status='done'` is already \
 complete: treat both as tombstones. If a candidate resembles a dropped or done task, \
 `skip` it — never recreate or reopen retired work unless the user explicitly asked for \
-it again in this conversation.
+it again in this conversation, and then reopen it with `update_task` (`status: open`) \
+rather than adding it again.
 
 For session tags, query the current session's tags:
 `SELECT tags FROM sessions WHERE id = '{session_id}'`
@@ -595,7 +596,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 (topic_id, claim),
             ).fetchone():
                 continue
-            dup = duplicate_statement(conn, claim, threshold)
+            dup = duplicate_statement(conn, claim, threshold, topic_id)
             if dup:
                 _skip(session_id, action, "near_duplicate", statement_id=dup["id"])
                 continue

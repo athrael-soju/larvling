@@ -177,6 +177,9 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "No matches.")
         out = subprocess.run([sys.executable, script], capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 1)
+        out = subprocess.run([sys.executable, script, "billing", "--limit", "-1"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 1)
 
 
 class DuplicateTest(unittest.TestCase):
@@ -228,6 +231,37 @@ class DuplicateTest(unittest.TestCase):
         self.assertEqual(self.count("topics"), 1)
         self.assertEqual(self.count("statements"), 2)
 
+    def test_a_rewording_in_another_topic_is_not_a_duplicate_statement(self):
+        self.conn.execute("INSERT INTO topics (id, title, domain, tags) VALUES (2, 'Reporting', 'technical', 'r')")
+        analyze.process_knowledge(self.conn, [
+            knowledge("The billing database: PostgreSQL 15", "billing database is PostgreSQL 15",
+                      action="add_statement", topic_id=2),
+        ], SID, USER, "")
+        self.assertEqual(self.count("statements"), 2)
+
+    def test_tasks_that_differ_in_a_name_month_or_number_are_kept(self):
+        for title in ("Send the quarterly billing report to Alice",
+                      "Pay the March invoice for the office lease",
+                      "Upgrade the billing service to Python 3.12"):
+            analyze.process_tasks(self.conn, [task(title)], SID)
+        result = analyze.process_tasks(self.conn, [
+            task("Send the quarterly billing report to Bob"),
+            task("Pay the April invoice for the office lease"),
+            task("Upgrade the billing service to Python 3.13"),
+            task("Send quarterly billing reports to Alice"),  # a rewording
+        ], SID)
+        self.assertEqual(result, (3, 0, 0))
+
+    def test_a_long_claim_with_a_fact_added_is_kept(self):
+        base = ("Billing database is PostgreSQL 15 running on a dedicated GKE node pool "
+                "with nightly backups to a regional bucket kept for thirty days")
+        analyze.process_knowledge(self.conn, [
+            knowledge(base, "billing database is PostgreSQL 15", action="add_statement", topic_id=1),
+            knowledge(base + " and point-in-time recovery enabled", "billing database is PostgreSQL 15",
+                      action="add_statement", topic_id=1),
+        ], SID, USER, "")
+        self.assertEqual(self.count("statements"), 3)
+
     def test_the_threshold_is_configurable_and_zero_turns_it_off(self):
         write_config({"dedup_threshold": 0})
         result = analyze.process_tasks(self.conn, [task("auth module refactor")], SID)
@@ -260,6 +294,20 @@ class WithoutFts5Test(unittest.TestCase):
         with db.open_db() as conn:
             self.assertTrue(db.fts_in_step(conn))
 
+    def test_a_very_long_word_does_not_break_the_like_fallback(self):
+        conn = fresh_db()
+        with mock.patch.object(db, "_fts5", False):
+            self.assertEqual(search.search_statements(conn, "x" * 60000), [])
+            self.assertEqual(search.search_tasks(conn, "x" * 60000), [])
+        conn.close()
+
+    def test_dropping_the_triggers_is_logged(self):
+        conn = fresh_db()
+        with mock.patch.object(db, "_fts5", False):
+            db.ensure_fts(conn)
+        conn.close()
+        self.assertEqual(support.logged("fts_triggers_dropped")[-1]["triggers"], len(db.FTS_TRIGGERS))
+
     def test_a_fresh_install_works_without_fts5(self):
         support.reset_db()
         with mock.patch.object(db, "_fts5", False):
@@ -273,7 +321,63 @@ class WithoutFts5Test(unittest.TestCase):
                 self.assertEqual(len(search.search_tasks(conn, "docs")), 1)
 
 
+class ConfigTest(unittest.TestCase):
+    def test_the_threshold_must_be_a_number_from_0_to_1(self):
+        import config
+
+        for value, expected in [(0.9, 0.9), (1, 1.0), (0, 0.0), (80, 0.8), (-1, 0.8),
+                                (float("inf"), 0.8), (True, 0.8), ("0.9", 0.8)]:
+            with self.subTest(value=value):
+                with open(config.CONFIG_PATH, "w") as f:
+                    f.write(json.dumps({"dedup_threshold": value}))
+                self.assertEqual(config.get_config()["dedup_threshold"], expected)
+        os.remove(config.CONFIG_PATH)
+
+
+class SchemaDumpTest(unittest.TestCase):
+    def test_fts5s_own_tables_are_left_out(self):
+        schema = db.get_desired_schema()
+        self.assertIn("CREATE VIRTUAL TABLE statements_fts", schema)
+        for suffix in db.FTS_SHADOW_SUFFIXES:
+            self.assertNotIn(f"statements_fts_{suffix}", schema)
+
+    def test_an_empty_index_is_refilled_at_the_next_start(self):
+        # As a migration done by hand leaves it: tables and triggers, no rows.
+        conn = fresh_db()
+        conn.execute("INSERT INTO topics (id, title, domain, tags) VALUES (1, 'Billing', 'technical', 'b')")
+        conn.execute("INSERT INTO statements (topic_id, claim) VALUES (1, 'Uses Stripe')")
+        conn.execute("INSERT INTO tasks (title, domain) VALUES ('Write docs', 'technical')")
+        conn.execute("DELETE FROM statements_fts")
+        conn.execute("DELETE FROM tasks_fts")
+        conn.commit()
+        self.assertFalse(db.fts_in_step(conn))
+        conn.close()
+        self.assertEqual(run_preflight()[0], "current")
+        with db.open_db() as conn:
+            self.assertTrue(db.fts_in_step(conn))
+            self.assertEqual(len(search.search_statements(conn, "stripe")), 1)
+
+
 class SimilarityTest(unittest.TestCase):
+    def test_differences_that_change_the_meaning(self):
+        cases = [
+            ("Pay the March invoice for the office", "Pay the April invoice for the office", True),
+            ("Send the report draft to Alice for review", "Send the report draft to Bob for review", True),
+            ("We decided to use SQLite for the cache", "We decided not to use SQLite for the cache", True),
+            ("We don't deploy on Fridays", "We deploy on Fridays", True),
+            ("Upgrade billing to Python 3.12", "Upgrade billing to Python 3.13", True),
+            ("Refactor the auth modules", "auth module refactor", False),
+            ("Set up the CI pipeline", "Set up CI pipelines", False),
+            ("Fix the login bug on iOS", "Fix login bugs on iOS", False),
+        ]
+        for a, b, expected in cases:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(search.differ_in_kind(a, b), expected)
+
+    def test_similarity_compares_every_word(self):
+        opening = " ".join(f"word{n}" for n in range(16))
+        self.assertLess(search.similarity(opening, opening + " extra facts added here at the end"), 0.8)
+
     def test_similarity(self):
         cases = [
             ("Refactor the auth modules", "auth module refactor", 1.0),

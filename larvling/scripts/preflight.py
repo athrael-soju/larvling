@@ -449,7 +449,7 @@ def main():
         log("fts5_unavailable")
         print(
             "Larvling: this Python's SQLite has no FTS5, so knowledge search uses "
-            "plain LIKE matching and reworded duplicates aren't caught."
+            "plain LIKE matching, which ranks by how many words match rather than by relevance."
         )
 
 
