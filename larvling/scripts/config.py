@@ -5,7 +5,8 @@ import os
 
 CONFIG_PATH = os.path.join(
     os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
-    ".claude", "larvling.config.json",
+    ".claude",
+    "larvling.config.json",
 )
 
 DEFAULTS = {
@@ -16,6 +17,7 @@ DEFAULTS = {
     "summary_hints": True,
     "session_tags": True,
     "geolocation": False,
+    "model": "sonnet",
 }
 
 
@@ -26,9 +28,13 @@ def get_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             user = json.load(f)
         if isinstance(user, dict):
-            for key in DEFAULTS:
-                if key in user:
+            for key, default in DEFAULTS.items():
+                if key not in user:
+                    continue
+                if isinstance(default, bool):
                     config[key] = bool(user[key])
+                elif isinstance(user[key], str) and user[key].strip():
+                    config[key] = user[key].strip()
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return config

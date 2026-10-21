@@ -7,6 +7,8 @@ parsing, and LARVLING_INTERNAL guarding.
 
 import os
 
+from config import get_config
+
 
 async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=None):
     """Call the LLM via Agent SDK and return the response.
@@ -56,7 +58,7 @@ async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=N
         except MessageParseError:
             return None
 
-    opts = {"model": "claude-sonnet-4-6", "allowed_tools": allowed_tools or []}
+    opts = {"model": get_config()["model"], "allowed_tools": allowed_tools or []}
     if max_turns is not None:
         opts["max_turns"] = max_turns
     if output_format:
