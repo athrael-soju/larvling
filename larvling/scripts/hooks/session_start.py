@@ -11,6 +11,7 @@ from config import get_config
 from db import (
     SCHEMA_VERSION,
     escape_like,
+    log,
     get_plugin_version,
     get_summary,
     has_table,
@@ -18,7 +19,9 @@ from db import (
     reconfigure_stdout,
     get_schema_version,
 )
+from decay import decay_tasks, drop_candidates
 from health import recording_gap, pending_failure, clear_failure
+from hooks_util import spawn_with_payload
 
 CACHE_PATH = os.path.join(
     os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
@@ -228,6 +231,10 @@ def get_time_and_location(enable_geo=True):
     return " — ".join(parts)
 
 
+def _due(task):
+    return f" (due {task['due']})" if task["due"] else ""
+
+
 def get_session_context():
     """Build curated session context from summaries and relevant sessions."""
     with open_db() as conn:
@@ -263,7 +270,7 @@ def get_session_context():
         stmt_count = 0
         if has_table(conn, "topics"):
             topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
-            stmt_count = conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] if has_table(conn, "statements") else 0
+            stmt_count = conn.execute("SELECT COUNT(*) FROM current_statements").fetchone()[0] if has_table(conn, "statements") else 0
             if topic_count:
                 domain_rows = conn.execute(
                     "SELECT COALESCE(domain, 'unset') as d, COUNT(*) as c "
@@ -272,9 +279,12 @@ def get_session_context():
                 domains = ", ".join(
                     f"{r['d']} ({r['c']})" for r in domain_rows
                 )
+                # Leave out assessments (opinions, not facts) and statements
+                # that were superseded.
                 recent = conn.execute(
                     "SELECT t.id, t.title, s.id as sid, s.claim "
-                    "FROM topics t JOIN statements s ON s.topic_id = t.id "
+                    "FROM topics t JOIN current_statements s ON s.topic_id = t.id "
+                    "WHERE s.kind IS NOT 'assessment' "
                     "ORDER BY s.updated DESC, s.created DESC LIMIT 5"
                 ).fetchall()
                 lines.append(f"## Stored Knowledge ({topic_count} topics, {stmt_count} statements)")
@@ -298,11 +308,19 @@ def get_session_context():
         # below a threshold, list them all (unchanged for healthy DBs); above it, inject
         # a rollup + the top slice and point at a scoped query for the rest.
         if has_table(conn, "tasks"):
+            promoted, demoted = [], []
+            if cfg["task_tracking"]:
+                try:
+                    promoted, demoted = decay_tasks(conn, cfg)
+                    conn.commit()
+                except Exception as e:  # a locked DB must not cost the briefing
+                    conn.rollback()
+                    log("decay_error", error=str(e))
             total_open = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'open'"
             ).fetchone()[0]
             open_tasks = conn.execute(
-                "SELECT id, title, priority, horizon FROM tasks "
+                "SELECT id, title, priority, horizon, due FROM tasks "
                 "WHERE status = 'open' "
                 "ORDER BY CASE horizon WHEN 'now' THEN 1 WHEN 'soon' THEN 2 ELSE 3 END, "
                 "CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END"
@@ -313,7 +331,7 @@ def get_session_context():
                 if total_open <= LIST_ALL_MAX:
                     lines.append(f"## Open Tasks ({total_open})")
                     for t in open_tasks:
-                        lines.append(f"- [{t['priority']}/{t['horizon']}] {t['title']}")
+                        lines.append(f"- [{t['priority']}/{t['horizon']}] {t['title']}{_due(t)}")
                 else:
                     # Too many to list in full. Emit the shape (a rollup -- never capped),
                     # then list the actionable 'now' horizon COMPLETELY: bounded by urgency,
@@ -337,11 +355,37 @@ def get_session_context():
                     now_tasks = buckets["now"]
                     if 0 < len(now_tasks) <= NOW_LIST_MAX:
                         for t in now_tasks:
-                            lines.append(f"- [{t['priority']}/now] {t['title']}")
+                            lines.append(f"- [{t['priority']}/now] {t['title']}{_due(t)}")
                         lines.append("(now listed in full; query a scope for soon/later detail)")
                     else:
                         hint = "horizon='now'" if now_tasks else "horizon='soon'"
                         lines.append(f"(query a scope for detail, e.g. {hint} or priority='high')")
+                moved = []
+                if promoted:
+                    moved.append(f"{len(promoted)} to now (due within {cfg['due_soon_days']} days)")
+                if demoted:
+                    moved.append(
+                        f"{len(demoted)} from now to soon (untouched {cfg['decay_now_days']}+ days)"
+                    )
+                if moved:
+                    lines.append(f"Moved automatically: {'; '.join(moved)}.")
+                lines.append("")
+
+            stale = drop_candidates(conn, cfg) if cfg["task_tracking"] else []
+            if stale:
+                DROP_LIST_MAX = 10  # the oldest; the rest are a query away
+                lines.append(
+                    f"## Drop Candidates ({len(stale)}) - soon, untouched "
+                    f"{cfg['decay_soon_days']}+ days"
+                )
+                for t in stale[:DROP_LIST_MAX]:
+                    lines.append(f"- [{t['id']}] {t['title']} ({t['age']} days)")
+                if len(stale) > DROP_LIST_MAX:
+                    lines.append(
+                        f"({len(stale) - DROP_LIST_MAX} more; query status='open' AND "
+                        f"horizon='soon' AND updated < datetime('now', "
+                        f"'-{cfg['decay_soon_days']} days'))"
+                    )
                 lines.append("")
 
         # Fallback: if no summaries, show recent data
@@ -445,6 +489,29 @@ def build_health_banner(payload):
     return "\n".join(lines) if lines else None
 
 
+def start_catch_up(session_id, transcript_path=None):
+    """Extract earlier sessions that weren't fully extracted, in the background.
+
+    Covers sessions whose SessionEnd never ran (a crash, a closed terminal) or
+    whose extraction failed. The starting session itself is left out. The
+    worker finds the other sessions' transcripts next to *transcript_path*.
+    """
+    if not get_config()["analysis"]:
+        return
+    from analyze import pending_sessions
+
+    with open_db() as conn:
+        if not pending_sessions(conn, exclude=session_id):
+            return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "analyze.py")
+    spawn_with_payload(
+        os.path.normpath(script),
+        json.dumps(
+            {"catch_up": True, "session_id": session_id, "transcript_path": transcript_path}
+        ),
+    )
+
+
 def main():
     if os.environ.get("LARVLING_INTERNAL"):
         return
@@ -477,6 +544,11 @@ def main():
         print()
 
     print(get_session_context())
+
+    try:
+        start_catch_up((payload or {}).get("session_id"), (payload or {}).get("transcript_path"))
+    except Exception:
+        pass  # Catch-up is retried at the next start
 
     update_notice = check_update()
     if update_notice:

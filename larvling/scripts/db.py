@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 18
 
 
 def get_schema_version(conn):
@@ -131,13 +131,19 @@ def set_schema_version(conn, version=SCHEMA_VERSION):
     conn.execute(f"PRAGMA user_version = {int(version)}")
 
 
+# Tables FTS5 creates and manages for each index; never created by hand.
+FTS_SHADOW_SUFFIXES = ("data", "idx", "content", "docsize", "config")
+
+
 def get_current_schema(conn):
-    """Read the live schema from sqlite_master."""
+    """Read the live schema from sqlite_master, leaving out FTS5's own tables."""
     rows = conn.execute(
-        "SELECT sql FROM sqlite_master "
-        "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    return "\n".join(row[0] + ";" for row in rows if row[0])
+    virtual = [r[0] for r in rows if r[1] and r[1].upper().startswith("CREATE VIRTUAL TABLE")]
+    shadow = {f"{v}_{suffix}" for v in virtual for suffix in FTS_SHADOW_SUFFIXES}
+    return "\n".join(r[1] + ";" for r in rows if r[1] and r[0] not in shadow)
 
 
 def get_desired_schema():
@@ -148,6 +154,135 @@ def get_desired_schema():
     schema = get_current_schema(mem)
     mem.close()
     return schema
+
+
+# An update entry touches its task, however it is written: by extraction, by
+# /tidy, or by the agent keeping a drop candidate. tasks.updated is what task
+# decay goes by.
+TOUCH_TRIGGER = (
+    "CREATE TRIGGER IF NOT EXISTS updates_touch_task AFTER INSERT ON updates BEGIN "
+    "UPDATE tasks SET updated = new.timestamp WHERE id = new.task_id "
+    "AND (julianday(updated) IS NULL OR julianday(new.timestamp) > julianday(updated)); END"
+)
+
+
+# Statements still in force. A statement leaves it when it is superseded
+# (superseded_by names its replacement) or retired with no replacement.
+CURRENT_STATEMENTS_VIEW = (
+    "CREATE VIEW IF NOT EXISTS current_statements AS "
+    "SELECT * FROM statements WHERE superseded_at IS NULL"
+)
+
+
+# Full-text index over statement claims (with their topic's title) and task
+# titles, for ranked search and duplicate checks. Rowids are the statement and
+# task ids. Porter stemming matches "deploy" with "deploying".
+FTS_TABLES = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS statements_fts USING fts5("
+    "claim, topic_title, tokenize = 'porter unicode61 remove_diacritics 2')",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5("
+    "title, tokenize = 'porter unicode61 remove_diacritics 2')",
+)
+_STATEMENT_ROW = (
+    "INSERT INTO statements_fts (rowid, claim, topic_title) VALUES "
+    "(new.id, new.claim, (SELECT title FROM topics WHERE id = new.topic_id));"
+)
+FTS_TRIGGERS = {
+    "statements_fts_insert": "CREATE TRIGGER IF NOT EXISTS statements_fts_insert "
+    f"AFTER INSERT ON statements BEGIN {_STATEMENT_ROW} END",
+    "statements_fts_update": "CREATE TRIGGER IF NOT EXISTS statements_fts_update "
+    "AFTER UPDATE OF claim, topic_id ON statements BEGIN "
+    f"DELETE FROM statements_fts WHERE rowid = old.id; {_STATEMENT_ROW} END",
+    "statements_fts_delete": "CREATE TRIGGER IF NOT EXISTS statements_fts_delete "
+    "AFTER DELETE ON statements BEGIN DELETE FROM statements_fts WHERE rowid = old.id; END",
+    "topics_fts_title": "CREATE TRIGGER IF NOT EXISTS topics_fts_title "
+    "AFTER UPDATE OF title ON topics BEGIN UPDATE statements_fts SET topic_title = new.title "
+    "WHERE rowid IN (SELECT id FROM statements WHERE topic_id = new.id); END",
+    "tasks_fts_insert": "CREATE TRIGGER IF NOT EXISTS tasks_fts_insert "
+    "AFTER INSERT ON tasks BEGIN INSERT INTO tasks_fts (rowid, title) VALUES (new.id, new.title); END",
+    "tasks_fts_update": "CREATE TRIGGER IF NOT EXISTS tasks_fts_update "
+    "AFTER UPDATE OF title ON tasks BEGIN DELETE FROM tasks_fts WHERE rowid = old.id; "
+    "INSERT INTO tasks_fts (rowid, title) VALUES (new.id, new.title); END",
+    "tasks_fts_delete": "CREATE TRIGGER IF NOT EXISTS tasks_fts_delete "
+    "AFTER DELETE ON tasks BEGIN DELETE FROM tasks_fts WHERE rowid = old.id; END",
+}
+
+_fts5 = None
+
+
+def fts5_available():
+    """True if this Python's SQLite build has FTS5."""
+    global _fts5
+    if _fts5 is None:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+            _fts5 = True
+        except sqlite3.OperationalError:
+            _fts5 = False
+        finally:
+            probe.close()
+    return _fts5
+
+
+def _fts_triggers(conn):
+    return {
+        r[0]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        if r[0] in FTS_TRIGGERS
+    }
+
+
+def fts_in_step(conn):
+    """True if the search index matches what this SQLite build supports, and
+    holds every statement and task (a migration done by hand creates it empty)."""
+    if not fts5_available():
+        return not _fts_triggers(conn)
+    if not (
+        has_table(conn, "statements_fts")
+        and has_table(conn, "tasks_fts")
+        and _fts_triggers(conn) == set(FTS_TRIGGERS)
+    ):
+        return False
+    try:
+        return conn.execute(
+            "SELECT (SELECT COUNT(*) FROM statements_fts) = (SELECT COUNT(*) FROM statements) "
+            "AND (SELECT COUNT(*) FROM tasks_fts) = (SELECT COUNT(*) FROM tasks)"
+        ).fetchone()[0] == 1
+    except sqlite3.OperationalError:
+        return False
+
+
+def ensure_fts(conn):
+    """Bring the search index in step with this SQLite build.
+
+    With FTS5: creates the index tables and their triggers where missing, and
+    refills the index, since rows written without the triggers aren't in it.
+    Without FTS5: drops the triggers, which would otherwise make every write
+    to statements, topics and tasks fail; search falls back to LIKE.
+    Returns True if the index is usable.
+    """
+    if fts_in_step(conn):
+        return fts5_available()
+    if not fts5_available():
+        dropped = sorted(_fts_triggers(conn))
+        for name in dropped:
+            conn.execute(f"DROP TRIGGER {name}")
+        if dropped:
+            log("fts_triggers_dropped", reason="no FTS5 in this SQLite", triggers=len(dropped))
+        return False
+    for sql in FTS_TABLES:
+        conn.execute(sql)
+    for sql in FTS_TRIGGERS.values():
+        conn.execute(sql)
+    conn.execute("DELETE FROM statements_fts")
+    conn.execute(
+        "INSERT INTO statements_fts (rowid, claim, topic_title) "
+        "SELECT s.id, s.claim, t.title FROM statements s LEFT JOIN topics t ON t.id = s.topic_id"
+    )
+    conn.execute("DELETE FROM tasks_fts")
+    conn.execute("INSERT INTO tasks_fts (rowid, title) SELECT id, title FROM tasks")
+    return True
 
 
 def create_schema(conn):
@@ -165,7 +300,10 @@ def create_schema(conn):
             summary_at TEXT,
             summary_msg_count INTEGER,
             tags TEXT,
-            summary_offered INTEGER DEFAULT 0
+            summary_offered INTEGER DEFAULT 0,
+            extracted_at TEXT,
+            extracted_through INTEGER,
+            extract_lease TEXT
         )
     """
     )
@@ -200,7 +338,12 @@ def create_schema(conn):
             topic_id INTEGER NOT NULL REFERENCES topics(id),
             claim TEXT NOT NULL,
             created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            source TEXT CHECK(source IN ('user', 'agent', 'doc', 'manual')),
+            kind TEXT CHECK(kind IN ('fact', 'decision', 'preference', 'assessment')),
+            session_id TEXT REFERENCES sessions(id),
+            superseded_by INTEGER REFERENCES statements(id) ON DELETE SET NULL,
+            superseded_at TEXT
         )
     """
     )
@@ -215,7 +358,8 @@ def create_schema(conn):
             horizon TEXT NOT NULL DEFAULT 'later' CHECK(horizon IN ('now', 'soon', 'later')),
             metadata TEXT,
             created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            due TEXT
         )
     """
     )
@@ -229,6 +373,7 @@ def create_schema(conn):
         )
     """
     )
+    conn.execute(TOUCH_TRIGGER)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
     )
@@ -239,11 +384,19 @@ def create_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_statements_topic ON statements(topic_id)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_session ON statements(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_superseded_by ON statements(superseded_by)"
+    )
+    conn.execute(CURRENT_STATEMENTS_VIEW)
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_updates_task ON updates(task_id)"
     )
+    ensure_fts(conn)
     conn.commit()
 
 

@@ -5,8 +5,9 @@ description: Audit and consolidate Larvling's knowledge base, tasks, and session
 
 **Schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT)`
-- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT [open|done|dropped], priority TEXT [low|medium|high], horizon TEXT [now|soon|later], metadata TEXT, created TEXT, updated TEXT)`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
+- `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
+- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT [open|done|dropped], priority TEXT [low|medium|high], horizon TEXT [now|soon|later], metadata TEXT, created TEXT, updated TEXT [last touched], due TEXT [YYYY-MM-DD])`
 - `updates (id INTEGER PK AUTO, task_id INTEGER FK→tasks(id), content TEXT NOT NULL, timestamp TEXT)`
 - `sessions (id TEXT PK, started_at TEXT, ended_at TEXT, duration_min REAL, title TEXT, agent_summary TEXT, exchange_count INT, tags TEXT, ...)`
 
@@ -21,7 +22,7 @@ Create tasks to track the audit phases so the user sees progress:
 3. **Audit sessions** (activeForm: "Auditing sessions") — untitled, empty, missing summaries
 4. **Apply approved changes** (activeForm: "Applying changes") — mark complete after agent finishes
 
-Delegate the full audit to the `knowledge-maintenance` agent. It will inspect each area, identify issues (duplicates, stale entries, misclassifications, contradictions, orphaned or empty rows), propose changes via AskUserQuestion, and apply only what the user approves.
+Delegate the full audit to the `knowledge-maintenance` agent, telling it this session's ID (`${CLAUDE_SESSION_ID}`) for the statements it writes. It will inspect each area, identify issues (duplicates, stale entries, misclassifications, contradictions, orphaned or empty rows), propose changes via AskUserQuestion, and apply only what the user approves.
 
 Once the agent completes, present a brief before/after summary. Do not send follow-up messages to the agent after it finishes.
 
