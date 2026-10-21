@@ -1,6 +1,6 @@
 {
   "name": "larvling",
-  "version": "0.1.35",
+  "version": "0.1.36",
   "description": "Agentic memory - automatic conversation tracking, session context, and persistent knowledge for Claude Code",
   "author": {
     "name": "athrael-soju",
