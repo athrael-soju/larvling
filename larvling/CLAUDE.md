@@ -73,12 +73,12 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 - `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
 - `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 - `statements_fts (claim, topic_title)`, `tasks_fts (title)` — FTS5 search index, rowid = statement/task id, kept in sync by triggers. Search through `search.py` rather than querying these directly. Without FTS5 in this Python's SQLite they are absent, or present but out of date (their triggers are dropped so writes keep working), and `search.py` uses `LIKE` instead. FTS5 creates and manages its own `*_fts_data`, `_idx`, `_content`, `_docsize` and `_config` tables; never create those by hand.
-- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'medium', horizon TEXT DEFAULT 'later', metadata TEXT, created TEXT, updated TEXT)`
+- `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'medium', horizon TEXT DEFAULT 'later', metadata TEXT, created TEXT, updated TEXT [last touched], due TEXT [YYYY-MM-DD])`
 - `updates (id INTEGER PK AUTO, task_id INTEGER FK→tasks(id), content TEXT NOT NULL, timestamp TEXT)`
 
 **JSON metadata columns** (query with `json_extract(metadata, '$.field')`):
 
-- `tasks.metadata` — optional. Populated on `add_task` with `{"source_session_id": "<sid>"}` when a real session id is known; NULL otherwise. Trace a task back to the session that produced it with `json_extract(metadata, '$.source_session_id')`.
+- `tasks.metadata` — optional. Populated on `add_task` with `{"source_session_id": "<sid>"}` when a real session id is known; NULL otherwise. Trace a task back to the session that produced it with `json_extract(metadata, '$.source_session_id')`. Task decay adds `due_promoted` (the due date it last moved the task to `now` for, or found it already there) so it moves a task once per due date.
 - `messages.metadata` — populated by hooks on every turn:
   - user messages: `{"cwd", "permission_mode", "usage": {input_tokens_estimate}}`
   - assistant messages: `{"tool_calls": {<tool>: <count>}, "usage": {input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens, ...}}`
@@ -108,7 +108,7 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 | topics | id, title, domain, tags |
 | statements | id, topic_id, claim, source, kind, session_id, superseded_by, superseded_at |
 | current_statements (view) | same as statements, only those still in force |
-| tasks | id, title, status, priority, horizon, metadata |
+| tasks | id, title, status, priority, horizon, due, updated, metadata |
 | sessions | id, started_at, title, agent_summary |
 | messages | id, session_id, role, content |
 | updates | id, task_id, content, timestamp |
@@ -126,7 +126,9 @@ Larvling stores persistent knowledge in the `topics` + `statements` tables, and 
 **SessionEnd / PreCompact → Session extraction (write):** `analyze.py` runs once per session, in a detached process started by the SessionEnd hook, and again before each compaction (leaving a prompt still being answered for later, so it is extracted with its answer). It reads the user and agent messages the session recorded since its last extraction (`sessions.extracted_through`), relabelling first any prompt the transcript shows Claude Code or an agent wrote, and calls `sdk.py` (`call_model()`, model from the `model` config key) with the whole conversation, so a claim the user corrects later in the session is stored only in its corrected form. A long session is split into chunks of about 60k characters, one call each. The Stop hook only records: the reply, and as user messages anything the user added while the agent worked (queued messages, AskUserQuestion answers, feedback on a rejected tool call). At SessionStart, `session_start.py` catches up on earlier sessions that still have unextracted messages and have been quiet for 10 minutes, in the DB and in their transcript (a crash, a closed terminal, a failed call). A lease on the session (`sessions.extract_lease`) keeps two workers from extracting it at once; the SessionEnd worker waits for one that is still running. With `analysis` off, SessionEnd marks the session extracted, so turning it back on doesn't extract what was recorded in between. The extraction agent has Bash tool access to query all 6 tables for dedup — given the full schema, it decides what queries to run. Each call extracts multiple data types:
 - **Knowledge** → `topics` + `statements` tables (hierarchical: topic groups related statements). Actions: `add_topic`, `add_statement`, `supersede_statement` (replaces a current statement that is wrong, out of date or less precise; the old one is kept as history), `update_topic`. Every statement records its provenance: `source` (`user` or `agent` for extraction, `manual` for `/remember`), `kind` (`fact`, `decision`, `preference`, `assessment`) and the `session_id` that produced it. Statements stored before provenance existed have NULL `source`/`kind`, and a `session_id` only where it could be recovered from the message log. Extraction enforces where knowledge may come from. Anything about the user, their work or the people they deal with comes from the user's own words: their prompt, plus what they add while the agent works (queued messages, AskUserQuestion answers, feedback on a rejected tool call). From the agent, only general domain facts are kept, plus judgements the user explicitly agreed with, stored as `assessment`. Each item must quote its evidence, and an item whose quote isn't in a message from the speaker it names is dropped. The check proves the quote is there, not that it supports the claim: the prompt asks for claims that say no more than their evidence, and that is all that stops an inference built on a real quote. Assessments stay out of the session-start briefing and default `/recall`.
 - **Session tags** → `sessions.tags` column, comma-separated, consolidated at each extraction. The agent queries current tags itself.
-- **Tasks** → `tasks` + `updates` tables. Actions: `add_task`, `add_update` (attach context/notes), `update_task` (modify status/priority/horizon with reason). Invalid fields skip the item and log to JSONL — no silent coercion.
+- **Tasks** → `tasks` + `updates` tables. Actions: `add_task`, `add_update` (attach context/notes), `update_task` (modify status/priority/horizon/due with reason). A task gets a `due` date only when the user gives one. Every change moves `tasks.updated`, and so does every update entry, however it is written (a trigger on `updates`), so it means last touched. Invalid fields skip the item and log to JSONL — no silent coercion — except a `due` that isn't a date, which is left out (logged as `extraction_field_dropped`) so the rest of the item still lands.
+
+**SessionStart → Task decay (write):** before the briefing, code (not the model) keeps the `now` list to work that is being done. An open task due within `due_soon_days` (default 7, overdue included) moves to `now`, once per due date, so a task the user moves back out stays where they put it; an open `now` task untouched for `decay_now_days` (default 7) moves to `soon`. Each move adds an update entry saying why, and the briefing notes `Moved automatically: ...`. Open `soon` tasks untouched for `decay_soon_days` (default 30) are listed under **Drop Candidates**; they are never dropped automatically. The thresholds live in `.claude/larvling.config.json`; `0` turns a rule off.
 
 **Log format** — JSONL (one JSON object per line) in `.claude/larvling.jsonl`:
 ```jsonl
@@ -142,6 +144,10 @@ Larvling stores persistent knowledge in the `topics` + `statements` tables, and 
 ```
 
 **Manual skills** (`/remember`, `/recall`, `/forget`) still work for explicit user-initiated knowledge management.
+
+### Drop Candidates
+
+When the SessionStart context lists **Drop Candidates**, mention them once, briefly, and offer to drop them with AskUserQuestion (type: Decision): **Drop them** (set `status = 'dropped'` with an update entry saying why), **Keep them** (add an update entry for each, which counts as touching it), or **Review one by one**. Don't raise them again in the session.
 
 ### Proactive Task Nudges
 
