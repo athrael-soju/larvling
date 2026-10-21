@@ -24,6 +24,9 @@ from db import (
     get_current_schema,
     get_desired_schema,
     CURRENT_STATEMENTS_VIEW,
+    ensure_fts,
+    fts5_available,
+    fts_in_step,
 )
 
 
@@ -181,12 +184,22 @@ def migrate_v15_to_v16(conn):
     conn.execute(CURRENT_STATEMENTS_VIEW)
 
 
+def migrate_v16_to_v17(conn):
+    """v17: full-text index over statements and tasks, filled from existing rows.
+
+    Without FTS5 in this SQLite build the index is left out; ensure_fts adds it
+    at a later start whose SQLite has FTS5.
+    """
+    return {"fts5": ensure_fts(conn)}
+
+
 # Schema version -> the step that upgrades it by one. Don't change a step
 # after release; add a new one.
 MIGRATIONS = {
     13: migrate_v13_to_v14,
     14: migrate_v14_to_v15,
     15: migrate_v15_to_v16,
+    16: migrate_v16_to_v17,
 }
 
 
@@ -251,6 +264,20 @@ def backup_db(db_version):
     return path
 
 
+def _keep_fts_in_step(conn):
+    """Build or drop the search index if this Python's SQLite differs from the
+    one that last set it up (see db.ensure_fts)."""
+    if fts_in_step(conn):
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        ensure_fts(conn)
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        conn.rollback()
+        log("fts_sync_error", error=str(e))
+
+
 def ensure_schema():
     """Ensure current schema exists.
 
@@ -275,6 +302,7 @@ def ensure_schema():
 
         db_version = get_schema_version(conn)
         if db_version == SCHEMA_VERSION:
+            _keep_fts_in_step(conn)
             return "current"
 
         # Hold the write lock from the backup to the end of the migration, so
@@ -402,6 +430,12 @@ def main():
     if result == "fresh":
         print("# Larvling - First Run\n")
         print("Database created at `.claude/larvling.db`.")
+    if result in ("fresh", "migrated") and not fts5_available():
+        log("fts5_unavailable")
+        print(
+            "Larvling: this Python's SQLite has no FTS5, so knowledge search uses "
+            "plain LIKE matching and reworded duplicates aren't caught."
+        )
 
 
 if __name__ == "__main__":

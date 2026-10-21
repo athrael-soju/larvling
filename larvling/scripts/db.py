@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 def get_schema_version(conn):
@@ -135,7 +135,7 @@ def get_current_schema(conn):
     """Read the live schema from sqlite_master."""
     rows = conn.execute(
         "SELECT sql FROM sqlite_master "
-        "WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%'"
+        "WHERE type IN ('table', 'index', 'view', 'trigger') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
     return "\n".join(row[0] + ";" for row in rows if row[0])
 
@@ -156,6 +156,105 @@ CURRENT_STATEMENTS_VIEW = (
     "CREATE VIEW IF NOT EXISTS current_statements AS "
     "SELECT * FROM statements WHERE superseded_at IS NULL"
 )
+
+
+# Full-text index over statement claims (with their topic's title) and task
+# titles, for ranked search and duplicate checks. Rowids are the statement and
+# task ids. Porter stemming matches "deploy" with "deploying".
+FTS_TABLES = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS statements_fts USING fts5("
+    "claim, topic_title, tokenize = 'porter unicode61 remove_diacritics 2')",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5("
+    "title, tokenize = 'porter unicode61 remove_diacritics 2')",
+)
+_STATEMENT_ROW = (
+    "INSERT INTO statements_fts (rowid, claim, topic_title) VALUES "
+    "(new.id, new.claim, (SELECT title FROM topics WHERE id = new.topic_id));"
+)
+FTS_TRIGGERS = {
+    "statements_fts_insert": "CREATE TRIGGER IF NOT EXISTS statements_fts_insert "
+    f"AFTER INSERT ON statements BEGIN {_STATEMENT_ROW} END",
+    "statements_fts_update": "CREATE TRIGGER IF NOT EXISTS statements_fts_update "
+    "AFTER UPDATE OF claim, topic_id ON statements BEGIN "
+    f"DELETE FROM statements_fts WHERE rowid = old.id; {_STATEMENT_ROW} END",
+    "statements_fts_delete": "CREATE TRIGGER IF NOT EXISTS statements_fts_delete "
+    "AFTER DELETE ON statements BEGIN DELETE FROM statements_fts WHERE rowid = old.id; END",
+    "topics_fts_title": "CREATE TRIGGER IF NOT EXISTS topics_fts_title "
+    "AFTER UPDATE OF title ON topics BEGIN UPDATE statements_fts SET topic_title = new.title "
+    "WHERE rowid IN (SELECT id FROM statements WHERE topic_id = new.id); END",
+    "tasks_fts_insert": "CREATE TRIGGER IF NOT EXISTS tasks_fts_insert "
+    "AFTER INSERT ON tasks BEGIN INSERT INTO tasks_fts (rowid, title) VALUES (new.id, new.title); END",
+    "tasks_fts_update": "CREATE TRIGGER IF NOT EXISTS tasks_fts_update "
+    "AFTER UPDATE OF title ON tasks BEGIN DELETE FROM tasks_fts WHERE rowid = old.id; "
+    "INSERT INTO tasks_fts (rowid, title) VALUES (new.id, new.title); END",
+    "tasks_fts_delete": "CREATE TRIGGER IF NOT EXISTS tasks_fts_delete "
+    "AFTER DELETE ON tasks BEGIN DELETE FROM tasks_fts WHERE rowid = old.id; END",
+}
+
+_fts5 = None
+
+
+def fts5_available():
+    """True if this Python's SQLite build has FTS5."""
+    global _fts5
+    if _fts5 is None:
+        probe = sqlite3.connect(":memory:")
+        try:
+            probe.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+            _fts5 = True
+        except sqlite3.OperationalError:
+            _fts5 = False
+        finally:
+            probe.close()
+    return _fts5
+
+
+def _fts_triggers(conn):
+    return {
+        r[0]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        if r[0] in FTS_TRIGGERS
+    }
+
+
+def fts_in_step(conn):
+    """True if the search index matches what this SQLite build supports."""
+    if not fts5_available():
+        return not _fts_triggers(conn)
+    return (
+        has_table(conn, "statements_fts")
+        and has_table(conn, "tasks_fts")
+        and _fts_triggers(conn) == set(FTS_TRIGGERS)
+    )
+
+
+def ensure_fts(conn):
+    """Bring the search index in step with this SQLite build.
+
+    With FTS5: creates the index tables and their triggers where missing, and
+    refills the index, since rows written without the triggers aren't in it.
+    Without FTS5: drops the triggers, which would otherwise make every write
+    to statements, topics and tasks fail; search falls back to LIKE.
+    Returns True if the index is usable.
+    """
+    if fts_in_step(conn):
+        return fts5_available()
+    if not fts5_available():
+        for name in _fts_triggers(conn):
+            conn.execute(f"DROP TRIGGER {name}")
+        return False
+    for sql in FTS_TABLES:
+        conn.execute(sql)
+    for sql in FTS_TRIGGERS.values():
+        conn.execute(sql)
+    conn.execute("DELETE FROM statements_fts")
+    conn.execute(
+        "INSERT INTO statements_fts (rowid, claim, topic_title) "
+        "SELECT s.id, s.claim, t.title FROM statements s LEFT JOIN topics t ON t.id = s.topic_id"
+    )
+    conn.execute("DELETE FROM tasks_fts")
+    conn.execute("INSERT INTO tasks_fts (rowid, title) SELECT id, title FROM tasks")
+    return True
 
 
 def create_schema(conn):
@@ -267,6 +366,7 @@ def create_schema(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_updates_task ON updates(task_id)"
     )
+    ensure_fts(conn)
     conn.commit()
 
 

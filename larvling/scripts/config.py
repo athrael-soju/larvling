@@ -18,6 +18,9 @@ DEFAULTS = {
     "session_tags": True,
     "geolocation": False,
     "model": "sonnet",
+    # Word overlap (0-1) at which a new statement or task counts as a
+    # reworded duplicate of an existing one and is skipped.
+    "dedup_threshold": 0.8,
 }
 
 
@@ -31,10 +34,15 @@ def get_config():
             for key, default in DEFAULTS.items():
                 if key not in user:
                     continue
+                value = user[key]
                 if isinstance(default, bool):
-                    config[key] = bool(user[key])
-                elif isinstance(user[key], str) and user[key].strip():
-                    config[key] = user[key].strip()
+                    config[key] = bool(value)
+                elif isinstance(default, (int, float)):
+                    # A number of the default's kind, not negative; true/false aren't numbers here.
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                        config[key] = type(default)(value)
+                elif isinstance(value, str) and value.strip():
+                    config[key] = value.strip()
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return config
