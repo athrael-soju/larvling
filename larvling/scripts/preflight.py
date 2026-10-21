@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db import (
     DB_PATH,
@@ -38,17 +38,25 @@ _TURN_WINDOW = timedelta(minutes=10)
 
 
 def _parse_ts(value):
+    """Parse a stored timestamp as naive UTC, the way SQLite writes them."""
     try:
-        return datetime.fromisoformat(value)
+        ts = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
 
 
 def _load_messages(conn, where):
-    """Return [(timestamp, session_id, role)] for matching messages, oldest first."""
+    """Return [(timestamp, session_id, role)] for matching messages, oldest first.
+
+    Messages whose session row is missing are left out.
+    """
     rows = []
     for r in conn.execute(
-        f"SELECT id, session_id, role, timestamp FROM messages WHERE {where}"
+        "SELECT m.id, m.session_id, m.role, m.timestamp FROM messages m "
+        f"JOIN sessions s ON s.id = m.session_id WHERE {where}"
     ):
         ts = _parse_ts(r["timestamp"])
         if ts:
@@ -67,14 +75,18 @@ def backfill_statement_sessions(conn):
     """Fill in session_id on old statements from the message log.
 
     A statement gets the session of, in order:
-    1. an "Extraction:" message within _MARKER_WINDOW of its `created` time, or
-    2. an unanswered user message in the _TURN_WINDOW before it.
+    1. an "Extraction:" message that wrote statements, within _MARKER_WINDOW
+       of its `created` time, or
+    2. if there is no such message, an unanswered user message in the
+       _TURN_WINDOW before it.
     If no session or more than one matches, session_id stays NULL.
     Returns the number of statements updated.
     """
-    markers = _load_messages(conn, "role = 'system' AND content LIKE 'Extraction:%'")
+    markers = _load_messages(
+        conn, "m.role = 'system' AND m.content LIKE 'Extraction:%statements%'"
+    )
     marker_times = [m[0] for m in markers]
-    turns = _load_messages(conn, "role IN ('user', 'assistant')")
+    turns = _load_messages(conn, "m.role IN ('user', 'assistant')")
     turn_times = [t[0] for t in turns]
 
     attributed = 0
@@ -87,9 +99,10 @@ def backfill_statement_sessions(conn):
 
         lo = bisect.bisect_left(marker_times, created - _MARKER_WINDOW)
         hi = bisect.bisect_right(marker_times, created + _MARKER_WINDOW)
-        sid = _sole(m[1] for m in markers[lo:hi])
+        nearby = markers[lo:hi]
+        sid = _sole(m[1] for m in nearby)
 
-        if sid is None:
+        if not nearby:
             lo = bisect.bisect_left(turn_times, created - _TURN_WINDOW)
             hi = bisect.bisect_right(turn_times, created)
             last_role = {}
@@ -135,20 +148,17 @@ MIGRATIONS = {
 
 
 def run_migrations(conn, from_version):
-    """Run the steps from *from_version* to SCHEMA_VERSION in one transaction.
+    """Run the steps from *from_version* to SCHEMA_VERSION and commit.
 
-    Returns the steps' stats, or None if a step is missing or fails (the DB
-    is left unchanged).
+    The caller holds the write lock (BEGIN IMMEDIATE). Returns the steps'
+    stats, or None if a step is missing or fails; the transaction is then
+    rolled back and the DB left unchanged.
     """
     versions = range(from_version, SCHEMA_VERSION)
     if not versions or any(v not in MIGRATIONS for v in versions):
+        conn.rollback()
         return None
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        current = get_schema_version(conn)
-        if current != from_version:  # another session already migrated
-            conn.rollback()
-            return {} if current == SCHEMA_VERSION else None
         stats = {}
         for v in versions:
             stats.update(MIGRATIONS[v](conn) or {})
@@ -161,20 +171,40 @@ def run_migrations(conn, from_version):
         return None
 
 
-def backup_db(conn, db_version):
+def _reserve_backup_path(db_version):
+    """Create an empty backup file under a name no earlier backup uses.
+
+    Tries larvling.db.v<N>.bak, then .v<N>.<stamp>.bak, .v<N>.<stamp>-2.bak, ...
+    O_EXCL makes taking a name atomic, so two sessions never share one.
+    """
+    base = DB_PATH + f".v{db_version}"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    names = [f"{base}.bak", f"{base}.{stamp}.bak"]
+    names += [f"{base}.{stamp}-{n}.bak" for n in range(2, 1000)]
+    for path in names:
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            continue
+        return path
+    raise RuntimeError(f"no free backup name for {base}")
+
+
+def backup_db(db_version):
     """Copy the DB before a migration, without overwriting an older backup.
 
-    conn.backup() includes recent writes that a plain file copy can miss.
-    Returns the backup path.
+    Uses its own connection: the caller holds the write lock, so the copy is
+    the committed DB as it is before migrating. The backup API includes recent
+    writes that a plain file copy can miss. Returns the backup path.
     """
-    path = DB_PATH + f".v{db_version}.bak"
-    if os.path.exists(path):
-        path = DB_PATH + f".v{db_version}.{time.strftime('%Y%m%d-%H%M%S')}.bak"
+    path = _reserve_backup_path(db_version)
+    src = sqlite3.connect(DB_PATH)
     dest = sqlite3.connect(path)
     try:
-        conn.backup(dest)
+        src.backup(dest)
     finally:
         dest.close()
+        src.close()
     return path
 
 
@@ -186,6 +216,7 @@ def ensure_schema():
         'current'  - schema up to date
         'migrated' - upgraded automatically (see MIGRATIONS)
         'migrate'  - no automatic upgrade, migration context printed for Claude
+        'busy'     - another session held the DB too long; try at the next start
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -203,7 +234,23 @@ def ensure_schema():
         if db_version == SCHEMA_VERSION:
             return "current"
 
-        backup_path = backup_db(conn, db_version)
+        # Hold the write lock from the backup to the end of the migration, so
+        # no other session migrates in between.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            log("schema_migration_busy", from_version=db_version, error=str(e))
+            return "busy"
+        db_version = get_schema_version(conn)
+        if db_version == SCHEMA_VERSION:  # another session migrated first
+            conn.rollback()
+            return "current"
+
+        try:
+            backup_path = backup_db(db_version)
+        except Exception:
+            conn.rollback()
+            raise
         stats = run_migrations(conn, db_version)
         if stats is not None:
             log(

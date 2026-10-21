@@ -6,6 +6,7 @@ import io
 import os
 import sqlite3
 import unittest
+from unittest import mock
 
 import support
 
@@ -104,22 +105,23 @@ V13_STATEMENTS = {
 }
 
 
-def make_v13_db():
+def make_v13_db(messages=V13_MESSAGES, statements=V13_STATEMENTS,
+                sessions=("sess-a", "sess-b", "sess-c")):
     conn = sqlite3.connect(db.DB_PATH)
     conn.executescript(V13_SCHEMA)
-    for sid in ("sess-a", "sess-b", "sess-c"):
+    for sid in sessions:
         conn.execute(
             "INSERT INTO sessions (id, started_at) VALUES (?, '2026-05-01 09:00:00')",
             (sid,),
         )
     conn.executemany(
         "INSERT INTO messages (session_id, timestamp, role, content) VALUES (?, ?, ?, ?)",
-        V13_MESSAGES,
+        messages,
     )
     conn.execute(
         "INSERT INTO topics (id, title, domain, tags) VALUES (1, 'Home', 'personal', 'home')"
     )
-    for sid, (created, _) in V13_STATEMENTS.items():
+    for sid, (created, _) in statements.items():
         conn.execute(
             "INSERT INTO statements (id, topic_id, claim, created, updated) "
             "VALUES (?, 1, ?, ?, ?)",
@@ -266,6 +268,115 @@ class MigrationTest(unittest.TestCase):
         result, out = run_preflight()
         self.assertEqual(result, "migrate")
         self.assertIn("version **12**, expected **14**", out)
+
+
+class BackfillEdgeCaseTest(unittest.TestCase):
+    """Each case is one statement; the expected session is in its fixture."""
+
+    def migrate(self, messages, created, sessions=("sess-a", "sess-b", "sess-c")):
+        support.reset_db()
+        make_v13_db(messages, {1: (created, None)}, sessions)
+        result, out = run_preflight()
+        self.assertEqual(result, "migrated", out)
+        with db.open_db() as conn:
+            # Only statements: an orphaned message is old data the migration leaves as is.
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check(statements)").fetchall(), [])
+            return conn.execute("SELECT session_id FROM statements WHERE id = 1").fetchone()[0]
+
+    def test_a_marker_that_wrote_no_statements_is_ignored(self):
+        # /remember mid-turn in sess-a; sess-b's extraction changed nothing.
+        session = self.migrate([
+            ("sess-a", "2026-05-01 10:00:00", "user", "/remember I prefer tabs"),
+            ("sess-b", "2026-05-01 10:01:02", "system", "Extraction: knowledge=no changes, no tasks"),
+        ], "2026-05-01 10:01:00")
+        self.assertEqual(session, "sess-a")
+
+    def test_markers_from_two_sessions_leave_the_statement_unassigned(self):
+        # The mid-turn pass would pick sess-c, but the markers already say it
+        # came from an extraction in sess-a or sess-b.
+        session = self.migrate([
+            ("sess-c", "2026-05-01 11:59:00", "user", "still thinking"),
+            ("sess-a", "2026-05-01 12:00:00", "system", MARKER),
+            ("sess-b", "2026-05-01 12:00:02", "system", MARKER),
+        ], "2026-05-01 12:00:01")
+        self.assertIsNone(session)
+
+    def test_messages_of_a_missing_session_are_ignored(self):
+        session = self.migrate([
+            ("ghost", "2026-05-01 10:00:00", "system", MARKER),
+        ], "2026-05-01 10:00:00", sessions=("sess-a",))
+        self.assertIsNone(session)
+
+    def test_timezone_aware_timestamps_are_compared_in_utc(self):
+        session = self.migrate([
+            ("sess-a", "2026-05-01 09:00:00", "user", "hi"),
+            ("sess-b", "2026-05-01T12:00:00+02:00", "system", MARKER),
+        ], "2026-05-01 10:00:01")
+        self.assertEqual(session, "sess-b")
+
+
+class MigrationLockTest(unittest.TestCase):
+    def setUp(self):
+        support.reset_db()
+        make_v13_db()
+
+    def backups(self):
+        return sorted(glob.glob(db.DB_PATH + ".v13*.bak"))
+
+    def test_a_session_that_finds_the_db_migrated_under_the_lock_backs_nothing_up(self):
+        self.assertEqual(run_preflight()[0], "migrated")
+        before = self.backups()
+        real = preflight.get_schema_version
+        reads = []
+
+        def stale_first_read(conn):
+            reads.append(1)
+            return 13 if len(reads) == 1 else real(conn)
+
+        with mock.patch.object(preflight, "get_schema_version", stale_first_read):
+            result, out = run_preflight()
+        self.assertEqual(result, "current")
+        self.assertEqual(out, "")
+        self.assertEqual(self.backups(), before)
+
+    def test_a_held_lock_reports_busy_without_the_agent_prompt(self):
+        real_get_db = db.get_db
+
+        def quick_timeout():
+            conn = real_get_db()
+            conn.execute("PRAGMA busy_timeout=100")
+            return conn
+
+        db.get_db().close()  # switch to WAL first, as every real DB already is
+        blocker = sqlite3.connect(db.DB_PATH)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            with mock.patch.object(db, "get_db", quick_timeout):
+                result, out = run_preflight()
+        finally:
+            blocker.rollback()
+            blocker.close()
+        self.assertEqual(result, "busy")
+        self.assertEqual(out, "")
+        self.assertEqual(self.backups(), [])
+        with open(os.path.join(support.CLAUDE_DIR, "larvling.jsonl"), encoding="utf-8") as f:
+            self.assertIn('"event":"schema_migration_busy"', f.read())
+        self.assertEqual(run_preflight()[0], "migrated")
+
+    def test_backup_names_are_taken_atomically_and_never_reused(self):
+        stamp = "20260501-090000"
+        taken = [db.DB_PATH + ".v13.bak", db.DB_PATH + f".v13.{stamp}.bak"]
+        for path in taken:
+            with open(path, "wb") as f:
+                f.write(b"older")
+        with mock.patch.object(preflight.time, "strftime", return_value=stamp):
+            first = preflight._reserve_backup_path(13)
+            second = preflight._reserve_backup_path(13)
+        self.assertEqual(first, db.DB_PATH + f".v13.{stamp}-2.bak")
+        self.assertEqual(second, db.DB_PATH + f".v13.{stamp}-3.bak")
+        for path in taken:
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"older")
 
 
 class ProcessKnowledgeTest(unittest.TestCase):
