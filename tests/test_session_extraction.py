@@ -22,6 +22,7 @@ from test_provenance import make_v13_db, run_preflight
 
 sys.path.insert(0, os.path.join(support.SCRIPTS_DIR, "hooks"))
 import prompt  # noqa: E402
+import session_end  # noqa: E402
 import session_start  # noqa: E402
 import stop  # noqa: E402
 
@@ -355,6 +356,53 @@ class StopRelabelTest(unittest.TestCase):
         text = "Check the deploy status."
         entry = {"type": "user", "message": {"role": "user", "content": text}}
         self.assertEqual(self.roles_after(text, entry), [("user", text), ("assistant", "Done.")])
+
+
+class MidTurnRecordingTest(unittest.TestCase):
+    PROMPT = "Set up CI for the repo."
+    QUEUED = "Also, I'm the only maintainer."
+
+    def setUp(self):
+        fresh_db()
+        with contextlib.redirect_stdout(io.StringIO()):
+            prompt.handle({"session_id": SID, "prompt": self.PROMPT})
+        self.path = os.path.join(support.PROJECT_DIR, "midturn.jsonl")
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": self.PROMPT}},
+            {"type": "attachment", "attachment": {
+                "type": "queued_command", "prompt": self.QUEUED, "origin": {"kind": "human"}}},
+            {"type": "assistant", "message": {
+                "role": "assistant", "content": [{"type": "text", "text": "Done."}]}},
+        ]
+        with open(self.path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def messages(self):
+        with db.open_db() as conn:
+            return [(r[0], r[1]) for r in conn.execute(
+                "SELECT role, content FROM messages ORDER BY id")]
+
+    def test_words_added_mid_turn_are_recorded_before_the_reply_once(self):
+        for _ in range(2):
+            stop.handle({"session_id": SID, "transcript_path": self.path})
+        self.assertEqual(self.messages(), [
+            ("user", self.PROMPT), ("user", self.QUEUED), ("assistant", "Done.")])
+
+    def test_a_queued_message_the_prompt_hook_recorded_is_not_added_again(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            prompt.handle({"session_id": SID, "prompt": self.QUEUED})
+        stop.handle({"session_id": SID, "transcript_path": self.path})
+        self.assertEqual(self.messages(), [
+            ("user", self.PROMPT), ("user", self.QUEUED), ("assistant", "Done.")])
+
+    def test_mid_turn_words_reach_extraction_but_are_not_exchanges(self):
+        stop.handle({"session_id": SID, "transcript_path": self.path})
+        model = FakeModel()
+        extract(model)
+        self.assertIn(f"[2] USER: {self.QUEUED}", model.prompts[0])
+        session_end.handle({"session_id": SID})
+        self.assertEqual(session_row()["exchange_count"], 1)
 
 
 @unittest.skipUnless(
