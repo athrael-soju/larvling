@@ -551,12 +551,13 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 continue
             if old["claim"] == claim:
                 continue
-            # The new claim may already be current (a legacy correction stored
-            # next to what it corrects): point at it instead of a second copy.
+            # The new claim may already be current in the same topic (a legacy
+            # correction stored next to what it corrects): point at it instead
+            # of a second copy.
             existing = conn.execute(
-                "SELECT id FROM current_statements WHERE claim = ? AND id != ? "
-                "ORDER BY id DESC LIMIT 1",
-                (claim, stmt_id),
+                "SELECT id FROM current_statements WHERE claim = ? AND topic_id = ? "
+                "AND id != ? ORDER BY id DESC LIMIT 1",
+                (claim, old["topic_id"], stmt_id),
             ).fetchone()
             if existing:
                 new_id = existing["id"]
@@ -963,22 +964,26 @@ def chunk_messages(messages, budget=None):
     (CHUNK_CHARS by default).
 
     A chunk that ends on user messages (a prompt, and what the user added
-    while it was answered) hands them to the next chunk, so a question and
-    its answer stay together.
+    while it was answered) hands them to the next chunk, up to half a chunk's
+    worth, so a question and its answer stay together.
     """
     budget = budget or CHUNK_CHARS
+
+    def length(message):
+        return min(len(message[2] or ""), MESSAGE_CHARS)
+
     chunks, current, size = [], [], 0
     for message in messages:
-        length = min(len(message[2] or ""), MESSAGE_CHARS)
-        if current and size + length > budget:
-            carry = []
-            while len(current) > 1 and current[-1][1] == "user":
+        if current and size + length(message) > budget:
+            carry, carried = [], 0
+            while (len(current) > 1 and current[-1][1] == "user"
+                   and carried + length(current[-1]) <= budget // 2):
+                carried += length(current[-1])
                 carry.insert(0, current.pop())
             chunks.append(current)
-            current = carry
-            size = sum(min(len(m[2] or ""), MESSAGE_CHARS) for m in carry)
+            current, size = carry, carried
         current.append(message)
-        size += length
+        size += length(message)
     if current:
         chunks.append(current)
     return chunks
@@ -1217,12 +1222,7 @@ def _recently_written(path, minutes):
 
 def _schema_ready(session_id):
     """Make sure the DB has this version's schema, migrating it if the
-    session's own start couldn't (another session held the DB).
-
-    Messages already recorded count as extracted after a migration, since
-    the code before v15 extracted after every exchange. This session's
-    weren't, after its last "Extraction:" message, so they are reopened.
-    """
+    session's own start couldn't (another session held the DB)."""
     with open_db() as conn:
         if get_schema_version(conn) == SCHEMA_VERSION:
             return True
@@ -1234,16 +1234,6 @@ def _schema_ready(session_id):
         log("extraction_error", session_id, context="schema",
             error=f"database not at schema v{SCHEMA_VERSION} ({status})")
         return False
-    if status == "migrated" and session_id:
-        with open_db() as conn:
-            conn.execute(
-                "UPDATE sessions SET extracted_through = ("
-                "SELECT MAX(id) FROM messages WHERE session_id = :s "
-                "AND role IN ('user', 'assistant') AND id < ("
-                "SELECT MAX(id) FROM messages WHERE session_id = :s "
-                "AND role = 'system' AND content LIKE 'Extraction:%')) WHERE id = :s",
-                {"s": session_id},
-            )
     return True
 
 
@@ -1258,7 +1248,7 @@ def _run(data):
     doesn't extract everything recorded in between.
     """
     session_id = data.get("session_id")
-    if not _schema_ready(None if data.get("catch_up") else session_id):
+    if not _schema_ready(session_id):
         return
     cfg = get_config()
     if not cfg["analysis"]:
