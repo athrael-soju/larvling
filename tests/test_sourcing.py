@@ -179,6 +179,33 @@ class SourcingRulesTest(unittest.TestCase):
             ["Wants CI", "The CI pipeline is over-engineered"],
         )
 
+    def test_a_contraction_counts_as_one_word(self):
+        user = "I'm a data engineer. I’m happy with that, don't worry."
+        too_short = [
+            item(claim="Is a data engineer", evidence="I'm a"),
+            item(claim="Pipeline is fine", source="agent", kind="assessment",
+                 evidence="your pipeline is over-engineered", endorsement="I’m"),
+        ]
+        self.assertEqual(self.stored(too_short, user, SPECULATIVE_AGENT + " Honestly, "
+                                     "your pipeline is over-engineered."), [])
+        self.assertEqual(
+            [e["reason"] for e in support.logged("extraction_skipped")],
+            ["evidence too short", "endorsement too short"],
+        )
+        # A straight quote matches a curly apostrophe in the message.
+        self.assertEqual(
+            len(self.stored([item(claim="Is a data engineer", evidence="I’m a data engineer")],
+                            user, "")),
+            1,
+        )
+
+    def test_evidence_in_thai_is_matched_mid_clause(self):
+        user = "ฉันชอบใช้ Python มากกว่า Java ในงาน"
+        preference = item(claim="Prefers Python to Java", kind="preference",
+                          evidence="ใช้ Python มากกว่า Java")
+        self.assertEqual([r["claim"] for r in self.stored([preference], user, "")],
+                         ["Prefers Python to Java"])
+
     def test_about_must_be_given_and_valid(self):
         fact = item(topic_title="GitHub Actions", claim="GitHub Actions reuses workflows",
                     domain="technical", source="agent", kind="fact",

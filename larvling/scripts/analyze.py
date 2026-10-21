@@ -305,10 +305,17 @@ def _field(item, key):
     return str(item.get(key) or "").strip()
 
 
-# Kana and CJK ideographs are written without spaces, so each character counts
-# as a word; otherwise a whole clause would be one word.
-_UNSPACED = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-_WORD = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+")
+# Kana, CJK ideographs, Thai, Lao, Khmer and Myanmar are written without spaces
+# between words, so each character counts as a word; otherwise a whole clause
+# would be one word.
+_UNSPACED = (
+    "\u0e00-\u0eff"  # Thai, Lao
+    "\u1000-\u109f\ua9e0-\ua9ff\uaa60-\uaa7f"  # Myanmar
+    "\u1780-\u17ff\u19e0-\u19ff"  # Khmer
+    "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana, CJK
+)
+# A contraction ("I'm", "don't") is one word.
+_WORD = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+(?:'[^\\W{_UNSPACED}]+)*")
 
 
 def _words(text):
