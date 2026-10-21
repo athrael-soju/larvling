@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 
@@ -110,7 +111,8 @@ class LastTurnTest(unittest.TestCase):
         """Return (user text, agent text) of the last turn of *entries*."""
         path = new_path()
         write(path, entries)
-        return transcript.parse_last_user_text(path), transcript.parse_last_turn(path)[0]
+        text, by_user, _ = transcript.parse_user_turn(path)
+        return (text if by_user else None), transcript.parse_last_turn(path)[0]
 
     def test_a_turn_started_by_a_task_notification_has_no_user_text(self):
         user_text, agent_text = self.parse(
@@ -153,7 +155,9 @@ class MidTurnWordsTest(unittest.TestCase):
         """Return (all user text, mid-turn texts) of the last turn of *entries*."""
         path = new_path()
         write(path, entries)
-        return transcript.parse_last_user_text(path), transcript.parse_mid_turn_user_texts(path)
+        prompt, by_user, mid_turn = transcript.parse_user_turn(path)
+        texts = ([prompt] if by_user else []) + mid_turn
+        return ("\n\n".join(texts) if texts else None), mid_turn
 
     def test_a_message_the_user_queues_mid_turn_is_user_text(self):
         user_text, mid_turn = self.parse(
@@ -275,3 +279,20 @@ class StopRecordingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentPromptsTest(unittest.TestCase):
+    def test_a_users_prompt_with_ide_tags_is_not_an_agent_prompt(self):
+        text = "Check the deploy status."
+        path = os.path.join(tempfile.mkdtemp(), "t.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for e in [
+                {"type": "user", "isMeta": True, "promptSource": "system",
+                 "message": {"role": "user", "content": text}},
+                {"type": "user", "message": {"role": "user", "content":
+                    f"<ide_opened_file>a.py</ide_opened_file>{text}"}},
+                {"type": "user", "isMeta": True, "promptSource": "system",
+                 "message": {"role": "user", "content": "Run the nightly report."}},
+            ]:
+                f.write(json.dumps(e) + "\n")
+        self.assertEqual(transcript.agent_prompts(path), {"Run the nightly report."})

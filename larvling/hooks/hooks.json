@@ -28,8 +28,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/scripts\" && PY=$(for p in python3.13 python3.12 python3.11 python3.10 python3; do command -v $p >/dev/null 2>&1 && echo $p && break; done); PY=${PY:-python} && _TMP=$(mktemp) && cat >\"$_TMP\" && $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/stop.py\" <\"$_TMP\"; $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py\" <\"$_TMP\"; rm -f \"$_TMP\"",
+            "command": "export PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/scripts\" && PY=$(for p in python3.13 python3.12 python3.11 python3.10 python3; do command -v $p >/dev/null 2>&1 && echo $p && break; done); PY=${PY:-python} && $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/stop.py\"",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "export PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/scripts\" && PY=$(for p in python3.13 python3.12 python3.11 python3.10 python3; do command -v $p >/dev/null 2>&1 && echo $p && break; done); PY=${PY:-python} && $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py\"",
+            "timeout": 10
           }
         ]
       }
@@ -39,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "export PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/scripts\" && PY=$(for p in python3.13 python3.12 python3.11 python3.10 python3; do command -v $p >/dev/null 2>&1 && echo $p && break; done); PY=${PY:-python} && $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/session_end.py\"",
+            "command": "export PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/scripts\" && PY=$(for p in python3.13 python3.12 python3.11 python3.10 python3; do command -v $p >/dev/null 2>&1 && echo $p && break; done); PY=${PY:-python} && _TMP=$(mktemp) && cat >\"$_TMP\" && $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/session_end.py\" <\"$_TMP\"; $PY \"${CLAUDE_PLUGIN_ROOT}/scripts/analyze.py\" <\"$_TMP\"; rm -f \"$_TMP\"",
             "timeout": 10
           }
         ]

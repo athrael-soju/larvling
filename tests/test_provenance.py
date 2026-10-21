@@ -154,7 +154,7 @@ class FreshSchemaTest(unittest.TestCase):
     def test_fresh_install_has_provenance_columns(self):
         self.assertEqual(run_preflight()[0], "fresh")
         with db.open_db() as conn:
-            self.assertEqual(db.get_schema_version(conn), 14)
+            self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
             names = [c[0] for c in columns(conn, "statements")]
             self.assertEqual(names[-3:], ["source", "kind", "session_id"])
             indexes = {r[1] for r in conn.execute("PRAGMA index_list(statements)")}
@@ -183,7 +183,7 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(out, "")  # nothing for the agent to do
 
         with db.open_db() as conn:
-            self.assertEqual(db.get_schema_version(conn), 14)
+            self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
                 len(V13_MESSAGES),
@@ -267,7 +267,7 @@ class MigrationTest(unittest.TestCase):
             db.set_schema_version(conn, 12)
         result, out = run_preflight()
         self.assertEqual(result, "migrate")
-        self.assertIn("version **12**, expected **14**", out)
+        self.assertIn(f"version **12**, expected **{db.SCHEMA_VERSION}**", out)
 
 
 class BackfillEdgeCaseTest(unittest.TestCase):

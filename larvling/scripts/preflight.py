@@ -140,10 +140,61 @@ def migrate_v13_to_v14(conn):
     return {"statements_attributed": backfill_statement_sessions(conn)}
 
 
+def migrate_v14_to_v15(conn):
+    """v15: track per-session extraction on sessions.
+
+    Earlier versions extracted after every exchange, so messages already
+    recorded count as extracted. A session active in the last day may have
+    been recorded by this version while the DB waited for its migration (a
+    busy start): there, only the exchanges up to the reply before its last
+    "Extraction:" message count (that message can land after the next prompt),
+    and catch-up extracts the rest.
+    """
+    conn.execute("ALTER TABLE sessions ADD COLUMN extracted_at TEXT")
+    conn.execute("ALTER TABLE sessions ADD COLUMN extracted_through INTEGER")
+    conn.execute("ALTER TABLE sessions ADD COLUMN extract_lease TEXT")
+    cur = conn.execute(MARK_EXTRACTED)
+    return {"sessions_marked_extracted": cur.rowcount}
+
+
+MARK_EXTRACTED = """
+UPDATE sessions SET
+    extracted_through = (
+        SELECT MAX(m.id) FROM messages m
+        WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+        AND (
+            (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id)
+                < datetime('now', '-1 day')
+            OR m.id <= (
+                SELECT MAX(r.id) FROM messages r
+                WHERE r.session_id = sessions.id AND r.role = 'assistant' AND r.id < (
+                    SELECT MAX(id) FROM messages
+                    WHERE session_id = sessions.id AND role = 'system'
+                    AND content LIKE 'Extraction:%'
+                )
+            )
+        )
+    ),
+    extracted_at = datetime('now')
+WHERE extracted_through IS NULL AND EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+)
+""".strip()
+
+# Schema version -> data an upgrade to it carries over, for a migration done
+# by hand. The automatic steps above run the same SQL.
+DATA_STEPS = {
+    15: ("Earlier versions extracted after every exchange, so count every "
+         "message already recorded as extracted", MARK_EXTRACTED),
+}
+
+
 # Schema version -> the step that upgrades it by one. Don't change a step
 # after release; add a new one.
 MIGRATIONS = {
     13: migrate_v13_to_v14,
+    14: migrate_v14_to_v15,
 }
 
 
@@ -282,7 +333,14 @@ def ensure_schema():
         + safe_path
         + "` from the current schema to the desired schema."
     )
-    print("Preserve all existing data. After migrating, run:")
+    steps = [DATA_STEPS[v] for v in sorted(DATA_STEPS) if v > db_version]
+    if steps:
+        print("Preserve all existing data, and once the new columns exist:")
+        for why, sql in steps:
+            print(f"- {why}:\n```sql\n{sql};\n```")
+        print("After migrating, run:")
+    else:
+        print("Preserve all existing data. After migrating, run:")
     print(
         f"```bash\n{py} -c \"import sqlite3; c=sqlite3.connect('{safe_path}'); c.execute('PRAGMA user_version={SCHEMA_VERSION}'); c.close()\"\n```"
     )

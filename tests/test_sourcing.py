@@ -6,11 +6,9 @@ LiveExtractionTest calls the model, so it only runs with LARVLING_LIVE_TESTS=1.
 
 import contextlib
 import io
-import json
 import os
 import re
 import sys
-import time
 import unittest
 
 import support
@@ -325,13 +323,12 @@ def _mentions_solo(claim):
 )
 class LiveExtractionTest(unittest.TestCase):
     def extract(self, user_text, agent_text):
-        fresh_db().close()
-        path = os.path.join(support.PROJECT_DIR, f"transcript-{time.time_ns()}.jsonl")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"type": "user", "message": {"role": "user", "content": user_text}}) + "\n")
-            f.write(json.dumps({"type": "assistant", "message": {
-                "role": "assistant", "content": [{"type": "text", "text": agent_text}]}}) + "\n")
-        analyze._run({"session_id": SID, "transcript_path": path})
+        conn = fresh_db()
+        db.record_message(conn, SID, "user", user_text)
+        db.record_message(conn, SID, "assistant", agent_text)
+        conn.commit()
+        conn.close()
+        analyze._run({"session_id": SID, "hook_event_name": "SessionEnd"})
         with db.open_db() as conn:
             ran = conn.execute(
                 "SELECT 1 FROM messages WHERE role = 'system' AND content LIKE 'Extraction:%'"

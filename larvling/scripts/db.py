@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 def get_schema_version(conn):
@@ -165,7 +165,10 @@ def create_schema(conn):
             summary_at TEXT,
             summary_msg_count INTEGER,
             tags TEXT,
-            summary_offered INTEGER DEFAULT 0
+            summary_offered INTEGER DEFAULT 0,
+            extracted_at TEXT,
+            extracted_through INTEGER,
+            extract_lease TEXT
         )
     """
     )
