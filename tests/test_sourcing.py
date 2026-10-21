@@ -144,6 +144,16 @@ class SourcingRulesTest(unittest.TestCase):
         part_word = item(claim="Small project", evidence="mall side project")
         self.assertEqual(len(self.stored([scattered, paraphrase, part_word], user, "")), 1)
 
+    def test_evidence_in_unspaced_scripts_is_matched_by_character(self):
+        user = "我是后端开发者，主要写Go服务。"
+        part = item(claim="Is a backend developer", evidence="后端开发者")
+        mixed = item(claim="Writes Go services", evidence="主要写Go服务")
+        too_short = item(claim="Writes Go", evidence="写Go")
+        self.assertEqual(
+            [r["claim"] for r in self.stored([part, mixed, too_short], user, "")],
+            ["Is a backend developer", "Writes Go services"],
+        )
+
     def test_evidence_needs_three_words_and_an_endorsement_two(self):
         # Every quote here is in the exchange, but a word or two turns up anywhere.
         user = "I want CI for my project. Thanks, agreed."

@@ -305,9 +305,15 @@ def _field(item, key):
     return str(item.get(key) or "").strip()
 
 
+# Kana and CJK ideographs are written without spaces, so each character counts
+# as a word; otherwise a whole clause would be one word.
+_UNSPACED = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_WORD = re.compile(f"[{_UNSPACED}]|[^\\W{_UNSPACED}]+")
+
+
 def _words(text):
     """Return the lowercase words of *text*, ignoring punctuation and spacing."""
-    return " ".join(re.findall(r"\w+", unicodedata.normalize("NFKC", text or "").casefold()))
+    return " ".join(_WORD.findall(unicodedata.normalize("NFKC", text or "").casefold()))
 
 
 def _quoted_in(quote, text):
