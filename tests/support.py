@@ -1,7 +1,6 @@
-"""Shared test setup: isolate Larvling in a throwaway project directory.
+"""Test setup: points Larvling at a temporary project directory.
 
-Import this before any Larvling module. db.py resolves DB_PATH from
-CLAUDE_PROJECT_DIR at import time, so the environment must be set first.
+Import this before any Larvling module; db.py reads CLAUDE_PROJECT_DIR on import.
 """
 
 import atexit
@@ -23,7 +22,7 @@ sys.path.insert(0, SCRIPTS_DIR)
 
 
 def reset_db():
-    """Delete the test database, its WAL files and any backups."""
+    """Delete the files Larvling wrote to the test .claude directory."""
     for name in os.listdir(CLAUDE_DIR):
         if name.startswith("larvling"):
             os.remove(os.path.join(CLAUDE_DIR, name))

@@ -13,7 +13,7 @@ import analyze
 import db
 import preflight
 
-# Frozen copy of the v13 schema (create_schema before provenance landed).
+# The v13 schema, copied from create_schema before v14.
 V13_SCHEMA = """
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,

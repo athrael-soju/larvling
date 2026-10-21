@@ -1,10 +1,8 @@
 """
 Larvling Preflight — schema bootstrap.
 Ensures the database and schema exist before any other hooks run.
-
-Upgrades with a registered step in MIGRATIONS run here, in code, inside one
-transaction. Anything else (no registered path, a failed step, a downgrade)
-falls back to printing both schemas for the agent to migrate.
+Upgrades listed in MIGRATIONS run automatically; any other version change
+prints both schemas for the agent to migrate.
 """
 
 import bisect
@@ -32,11 +30,10 @@ from db import (
 # Code-driven migrations
 # ---------------------------------------------------------------------------
 
-# analyze.py records its "Extraction: ..." system message in the same
-# transaction as the statements it inserts, so both share a timestamp.
+# analyze.py writes its "Extraction:" message in the same transaction as its
+# statements, so both get the same timestamp.
 _MARKER_WINDOW = timedelta(seconds=5)
-# A statement written mid-turn (/remember, ad-hoc SQL) lands after the user's
-# prompt is recorded and before the reply is. Bound how long that turn can run.
+# How long a turn can run when a statement is written during it (/remember).
 _TURN_WINDOW = timedelta(minutes=10)
 
 
@@ -61,20 +58,19 @@ def _load_messages(conn, where):
 
 
 def _sole(values):
-    """The single distinct value in *values*, or None if there are 0 or 2+."""
+    """Return the only distinct value in *values*, or None if there isn't exactly one."""
     distinct = set(values)
     return distinct.pop() if len(distinct) == 1 else None
 
 
 def backfill_statement_sessions(conn):
-    """Attribute legacy statements to the session that wrote them.
+    """Fill in session_id on old statements from the message log.
 
-    Each statement gets a session only when exactly one candidate fits:
-    1. Extraction writes: the session of the "Extraction:" system message
-       recorded within _MARKER_WINDOW of the statement's `created`.
-    2. Mid-turn writes: the session whose latest user/assistant message before
-       `created` is a user prompt no older than _TURN_WINDOW (a turn in flight).
-    Anything else stays NULL. Returns the number of statements attributed.
+    A statement gets the session of, in order:
+    1. an "Extraction:" message within _MARKER_WINDOW of its `created` time, or
+    2. an unanswered user message in the _TURN_WINDOW before it.
+    If no session or more than one matches, session_id stays NULL.
+    Returns the number of statements updated.
     """
     markers = _load_messages(conn, "role = 'system' AND content LIKE 'Extraction:%'")
     marker_times = [m[0] for m in markers]
@@ -110,10 +106,9 @@ def backfill_statement_sessions(conn):
 
 
 def migrate_v13_to_v14(conn):
-    """v14: provenance on statements (source, kind, session_id).
+    """v14: add source, kind and session_id to statements.
 
-    source/kind stay NULL on legacy rows rather than guessing; session_id is
-    backfilled where the message log pins it down.
+    Existing rows keep NULL source and kind; session_id is filled in where possible.
     """
     conn.execute(
         "ALTER TABLE statements ADD COLUMN "
@@ -132,18 +127,18 @@ def migrate_v13_to_v14(conn):
     return {"statements_attributed": backfill_statement_sessions(conn)}
 
 
-# from_version -> step that upgrades it to from_version + 1. Steps are frozen
-# snapshots: never edit one after release, add a new step instead.
+# Schema version -> the step that upgrades it by one. Don't change a step
+# after release; add a new one.
 MIGRATIONS = {
     13: migrate_v13_to_v14,
 }
 
 
 def run_migrations(conn, from_version):
-    """Upgrade *from_version* to SCHEMA_VERSION in code, in one transaction.
+    """Run the steps from *from_version* to SCHEMA_VERSION in one transaction.
 
-    Returns a dict of step stats on success, or None when there is no
-    registered path or a step failed (the DB is left as it was).
+    Returns the steps' stats, or None if a step is missing or fails (the DB
+    is left unchanged).
     """
     versions = range(from_version, SCHEMA_VERSION)
     if not versions or any(v not in MIGRATIONS for v in versions):
@@ -151,7 +146,7 @@ def run_migrations(conn, from_version):
     try:
         conn.execute("BEGIN IMMEDIATE")
         current = get_schema_version(conn)
-        if current != from_version:  # a concurrent session migrated first
+        if current != from_version:  # another session already migrated
             conn.rollback()
             return {} if current == SCHEMA_VERSION else None
         stats = {}
@@ -167,9 +162,10 @@ def run_migrations(conn, from_version):
 
 
 def backup_db(conn, db_version):
-    """Snapshot the DB before a migration. Never overwrites an earlier backup.
+    """Copy the DB before a migration, without overwriting an older backup.
 
-    Uses the SQLite backup API so pages still in the WAL are included.
+    conn.backup() includes recent writes that a plain file copy can miss.
+    Returns the backup path.
     """
     path = DB_PATH + f".v{db_version}.bak"
     if os.path.exists(path):
@@ -188,8 +184,8 @@ def ensure_schema():
     Returns:
         'fresh'    - first install, schema created
         'current'  - schema up to date
-        'migrated' - upgraded in code via MIGRATIONS
-        'migrate'  - no code path, migration context printed for Claude
+        'migrated' - upgraded automatically (see MIGRATIONS)
+        'migrate'  - no automatic upgrade, migration context printed for Claude
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
@@ -219,7 +215,7 @@ def ensure_schema():
             )
             return "migrated"
 
-        # No code path - dump both schemas for Claude to handle
+        # No automatic upgrade - dump both schemas for Claude to handle
         old_schema = get_current_schema(conn)
         new_schema = get_desired_schema()
 

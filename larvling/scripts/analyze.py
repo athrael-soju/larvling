@@ -40,8 +40,7 @@ VALID_DOMAINS = {
 VALID_PRIORITY = {"low", "medium", "high"}
 VALID_HORIZON = {"now", "soon", "later"}
 VALID_STATUS = {"open", "done", "dropped"}
-# Extraction only sees the two speakers; 'doc' and 'manual' sources are
-# written outside extraction (e.g. /remember writes 'manual').
+# Extraction sets 'user' or 'agent'. /remember sets 'manual'; 'doc' is unused for now.
 VALID_SOURCE = {"user", "agent"}
 VALID_KIND = {"fact", "decision", "preference", "assessment"}
 
@@ -276,8 +275,8 @@ def process_knowledge(conn, knowledge_list, session_id=None):
     """Process extracted knowledge into topics+statements tables.
 
     Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
-    Every statement written carries its provenance: source, kind and the
-    session that produced it (an updated claim takes the updater's provenance).
+    Each statement written gets a source, kind and session_id; updating a
+    statement replaces them.
     Never deletes data — retirement is done via updates, not removal.
     Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
     """
