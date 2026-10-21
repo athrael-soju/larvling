@@ -1,7 +1,10 @@
 """Config loading: zero-config defaults, boolean switches and the extraction model."""
 
 import asyncio
+import contextlib
+import io
 import json
+import os
 import sys
 import types
 import unittest
@@ -10,6 +13,7 @@ from unittest import mock
 import support
 
 import config
+import preflight
 import sdk
 
 
@@ -52,8 +56,8 @@ class ConfigTest(unittest.TestCase):
         self.assertIs(cfg["geolocation"], True)
 
 
-def fake_sdk(options_seen):
-    """Stand-in claude_agent_sdk modules that record the options call_model builds."""
+def fake_sdk(options_seen, version=sdk.MIN_SDK_VERSION):
+    """A stand-in claude_agent_sdk module that records the options call_model builds."""
     class ResultMessage:
         subtype = "success"
         structured_output = None
@@ -67,44 +71,77 @@ def fake_sdk(options_seen):
         return kwargs
 
     pkg = types.ModuleType("claude_agent_sdk")
-    pkg.__version__ = "0.1.0"
+    pkg.__version__ = version
     pkg.query, pkg.ClaudeAgentOptions, pkg.ResultMessage = query, options, ResultMessage
-    internal = types.ModuleType("claude_agent_sdk._internal")
-    parser = types.ModuleType("claude_agent_sdk._internal.message_parser")
-    parser.parse_message = lambda data: data
-    client = types.ModuleType("claude_agent_sdk._internal.client")
-    client.parse_message = parser.parse_message
-    errors = types.ModuleType("claude_agent_sdk._errors")
-    errors.MessageParseError = ValueError
-    pkg._internal, pkg._errors = internal, errors
-    internal.client, internal.message_parser = client, parser
-    return {
-        "claude_agent_sdk": pkg,
-        "claude_agent_sdk._internal": internal,
-        "claude_agent_sdk._internal.message_parser": parser,
-        "claude_agent_sdk._internal.client": client,
-        "claude_agent_sdk._errors": errors,
-    }
+    return {"claude_agent_sdk": pkg}
 
 
 class CallModelTest(unittest.TestCase):
-    """call_model hands the configured model to the SDK."""
+    """call_model hands the configured model to the SDK, apart from the user's setup."""
 
     def setUp(self):
         support.reset_db()
 
-    def model_used(self):
+    def options(self, version=sdk.MIN_SDK_VERSION, **kwargs):
         seen = {}
-        with mock.patch.dict(sys.modules, fake_sdk(seen)):
-            asyncio.run(sdk.call_model("hello"))
-        return seen["model"]
+        with mock.patch.dict(sys.modules, fake_sdk(seen, version)):
+            asyncio.run(sdk.call_model("hello", **kwargs))
+        return seen
 
     def test_default_is_the_sonnet_alias(self):
-        self.assertEqual(self.model_used(), "sonnet")
+        self.assertEqual(self.options()["model"], "sonnet")
 
     def test_pinned_model_reaches_the_sdk(self):
         write_config({"model": "claude-sonnet-5-5"})
-        self.assertEqual(self.model_used(), "claude-sonnet-5-5")
+        self.assertEqual(self.options()["model"], "claude-sonnet-5-5")
+
+    def test_the_call_runs_apart_from_the_users_setup(self):
+        seen = self.options(allowed_tools=["Bash"])
+        self.assertEqual(seen["setting_sources"], [])
+        self.assertIs(seen["strict_mcp_config"], True)
+        self.assertIn("no-session-persistence", seen["extra_args"])
+        self.assertEqual(seen["tools"], ["Bash"])
+        self.assertEqual(seen["allowed_tools"], ["Bash"])
+
+    def test_a_call_without_tools_is_offered_none(self):
+        self.assertEqual(self.options()["tools"], [])
+
+    def test_an_outdated_sdk_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "older than " + sdk.MIN_SDK_VERSION):
+            self.options(version="0.1.41")
+
+    def test_versions_compare_by_number(self):
+        self.assertFalse(sdk.sdk_outdated(sdk.MIN_SDK_VERSION))
+        self.assertFalse(sdk.sdk_outdated("0.10.0"))
+        self.assertFalse(sdk.sdk_outdated("1.0"))
+        self.assertTrue(sdk.sdk_outdated("0.2.99"))
+        self.assertTrue(sdk.sdk_outdated("unknown"))
+
+    def test_requirements_ask_for_the_minimum_version(self):
+        path = os.path.join(support.SCRIPTS_DIR, "..", "requirements.txt")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn(f"claude-agent-sdk>={sdk.MIN_SDK_VERSION}", f.read().split())
+
+
+class CheckDependenciesTest(unittest.TestCase):
+    """Session start installs the SDK when it is missing and upgrades it when it is old."""
+
+    def pip_calls(self, version):
+        done = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(sys.modules, fake_sdk({}, version)), \
+                mock.patch("subprocess.run", return_value=done) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(preflight.check_dependencies())
+        return [c.args[0] for c in run.call_args_list]
+
+    def test_a_current_sdk_is_left_alone(self):
+        self.assertEqual(self.pip_calls(sdk.MIN_SDK_VERSION), [])
+
+    def test_an_outdated_sdk_is_upgraded(self):
+        calls = self.pip_calls("0.1.41")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1:4], ["-m", "pip", "install"])
+        self.assertIn(f"claude-agent-sdk>={sdk.MIN_SDK_VERSION}", calls[0])
 
 
 if __name__ == "__main__":

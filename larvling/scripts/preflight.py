@@ -29,6 +29,7 @@ from db import (
     fts5_available,
     fts_in_step,
 )
+from sdk import MIN_SDK_VERSION, sdk_outdated
 
 
 # ---------------------------------------------------------------------------
@@ -417,14 +418,17 @@ def ensure_schema():
 def check_dependencies():
     """Check if required Python packages are installed.
 
-    Auto-installs from requirements.txt if missing.
+    Auto-installs from requirements.txt if missing, or upgrades
+    claude-agent-sdk if it is older than MIN_SDK_VERSION.
     Returns True if all dependencies are satisfied, False otherwise.
     """
     try:
-        import claude_agent_sdk  # noqa: F401
-        return True
+        import claude_agent_sdk
+        outdated = claude_agent_sdk.__version__
+        if not sdk_outdated(outdated):
+            return True
     except ImportError:
-        pass
+        outdated = None
 
     # Auto-install missing dependency
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
@@ -443,15 +447,20 @@ def check_dependencies():
         if req_file and os.path.isfile(req_file):
             cmd += ["-r", req_file]
         else:
-            cmd += ["claude-agent-sdk"]
+            cmd += [f"claude-agent-sdk>={MIN_SDK_VERSION}"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
     except subprocess.CalledProcessError as e:
-        print("# Larvling - Missing Dependency\n")
-        print("`claude-agent-sdk` could not be auto-installed. Install it manually:\n")
+        if outdated:
+            print("# Larvling - Outdated Dependency\n")
+            print(f"`claude-agent-sdk` {outdated} is older than {MIN_SDK_VERSION} and could "
+                  "not be upgraded automatically. Upgrade it manually:\n")
+        else:
+            print("# Larvling - Missing Dependency\n")
+            print("`claude-agent-sdk` could not be auto-installed. Install it manually:\n")
         print("```bash")
-        print(f"{sys.executable} -m pip install claude-agent-sdk")
+        print(f"{sys.executable} -m pip install --upgrade 'claude-agent-sdk>={MIN_SDK_VERSION}'")
         print("```\n")
         if e.stderr:
             print(f"Error: {e.stderr.strip()}\n")
@@ -459,6 +468,8 @@ def check_dependencies():
         return False
 
     # Verify import after install
+    if outdated:
+        return True  # this process keeps the old module; the next one loads the new
     try:
         import claude_agent_sdk  # noqa: F401
         return True

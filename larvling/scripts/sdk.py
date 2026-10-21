@@ -1,13 +1,29 @@
 """Claude Agent SDK integration for Larvling.
 
 Provides call_model() — the shared interface for calling Claude via
-the Agent SDK with structured output support, monkey-patched message
-parsing, and LARVLING_INTERNAL guarding.
+the Agent SDK with structured output support, run apart from the user's
+Claude Code setup, and LARVLING_INTERNAL guarding.
 """
 
 import os
 
 from config import get_config
+
+# The oldest claude-agent-sdk Larvling runs with; requirements.txt says the same.
+MIN_SDK_VERSION = "0.2.170"
+
+
+def _version(text):
+    """*text* such as "0.2.170" as a tuple of ints, or () if it isn't one."""
+    try:
+        return tuple(int(part) for part in text.split(".")[:3])
+    except (AttributeError, ValueError):
+        return ()
+
+
+def sdk_outdated(version):
+    """True if claude-agent-sdk *version* is older than MIN_SDK_VERSION."""
+    return _version(version) < _version(MIN_SDK_VERSION)
 
 
 async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=None):
@@ -19,46 +35,40 @@ async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=N
     - usage_info is the usage dict from ResultMessage, or None if
       not available.
 
+    The call runs apart from the user's Claude Code setup: it loads no
+    settings, CLAUDE.md, plugins, hooks or MCP servers, sees only the tools
+    in *allowed_tools*, and leaves no session transcript behind.
+
     Sets LARVLING_INTERNAL to prevent sub-agent from triggering hooks.
     """
     try:
+        import claude_agent_sdk
         from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
-        from claude_agent_sdk._internal.message_parser import parse_message  # noqa: PLC2701
-        from claude_agent_sdk._errors import MessageParseError  # noqa: PLC2701
-        import claude_agent_sdk._internal.client as _sdk_client  # noqa: PLC2701
-        import claude_agent_sdk as _sdk_pkg  # noqa: PLC2701
     except ImportError:
         raise RuntimeError(
             "claude_agent_sdk is required but not installed. "
             "Install it with: pip install claude-agent-sdk"
         )
-
-    # Verify the SDK version is compatible with our monkey-patch.
-    # The patch targets _internal.client.parse_message which may move or
-    # change signature in future SDK releases.
-    _TESTED_SDK_VERSIONS = ("0.1",)
-    sdk_version = getattr(_sdk_pkg, "__version__", "")
-    if sdk_version and not any(sdk_version.startswith(v) for v in _TESTED_SDK_VERSIONS):
-        import warnings
-        warnings.warn(
-            f"claude_agent_sdk {sdk_version} has not been tested with Larvling's "
-            f"parse_message patch (tested: {', '.join(_TESTED_SDK_VERSIONS)}.*). "
-            "If extraction fails, pin claude-agent-sdk to a tested version.",
-            stacklevel=2,
+    if sdk_outdated(claude_agent_sdk.__version__):
+        raise RuntimeError(
+            f"claude_agent_sdk {claude_agent_sdk.__version__} is older than "
+            f"{MIN_SDK_VERSION}. Upgrade it with: "
+            f"pip install --upgrade 'claude-agent-sdk>={MIN_SDK_VERSION}'"
         )
 
-    # Patch parse_message to skip unknown message types instead of crashing.
-    # The SDK (as of 0.1.39) doesn't handle rate_limit_event and other CLI
-    # message types, which kills the async generator mid-stream and loses
-    # all subsequent messages including the ResultMessage with structured_output.
-    # Note: not concurrent-safe — callers use asyncio.run() (one loop at a time).
-    def _tolerant_parse(data):
-        try:
-            return parse_message(data)
-        except MessageParseError:
-            return None
-
-    opts = {"model": get_config()["model"], "allowed_tools": allowed_tools or []}
+    tools = list(allowed_tools or [])
+    opts = {
+        "model": get_config()["model"],
+        # Offering only the allowed tools keeps the others' definitions,
+        # most of an unrestricted session's context, out of every call.
+        "tools": tools,
+        "allowed_tools": tools,
+        "setting_sources": [],
+        "strict_mcp_config": True,
+        # Otherwise Claude Code saves each call as a session transcript, a
+        # copy of the conversation being extracted.
+        "extra_args": {"no-session-persistence": None},
+    }
     if max_turns is not None:
         opts["max_turns"] = max_turns
     if output_format:
@@ -68,7 +78,6 @@ async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=N
     os.environ["LARVLING_INTERNAL"] = "1"
     # Remove CLAUDECODE to prevent "nested session" guard in the subprocess
     saved_claudecode = os.environ.pop("CLAUDECODE", None)
-    setattr(_sdk_client, "parse_message", _tolerant_parse)
 
     response_text = ""
     structured = None
@@ -76,8 +85,6 @@ async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=N
     usage_info = None
     try:
         async for msg in query(prompt=prompt, options=options):
-            if msg is None:
-                continue
             if isinstance(msg, ResultMessage):
                 result_subtype = getattr(msg, "subtype", None)
                 if msg.structured_output:
@@ -98,7 +105,6 @@ async def call_model(prompt, allowed_tools=None, max_turns=None, output_format=N
         os.environ.pop("LARVLING_INTERNAL", None)
         if saved_claudecode is not None:
             os.environ["CLAUDECODE"] = saved_claudecode
-        setattr(_sdk_client, "parse_message", parse_message)
 
     if structured is not None:
         return structured, usage_info
