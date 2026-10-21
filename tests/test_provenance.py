@@ -156,7 +156,7 @@ class FreshSchemaTest(unittest.TestCase):
         with db.open_db() as conn:
             self.assertEqual(db.get_schema_version(conn), db.SCHEMA_VERSION)
             names = [c[0] for c in columns(conn, "statements")]
-            self.assertEqual(names[-3:], ["source", "kind", "session_id"])
+            self.assertEqual(names[5:8], ["source", "kind", "session_id"])
             indexes = {r[1] for r in conn.execute("PRAGMA index_list(statements)")}
             self.assertIn("idx_statements_session", indexes)
 
@@ -436,16 +436,17 @@ class ProcessKnowledgeTest(unittest.TestCase):
         self.assertEqual(self.provenance(1), ("user", "preference", self.SID))
         self.assertEqual(self.provenance(2), ("agent", "fact", self.SID))
 
-    def test_update_takes_the_updaters_provenance(self):
+    def test_a_replacement_takes_the_new_provenance(self):
         self.process([self.item()])
         db.ensure_session(self.conn, "sess-2")
         self.process(
-            [self.item(action="update_statement", statement_id=1,
+            [self.item(action="supersede_statement", statement_id=1,
                        claim="Uses tabs, but spaces in YAML", kind="decision",
                        evidence="I use spaces in YAML")],
             "sess-2",
         )
-        self.assertEqual(self.provenance(1), ("user", "decision", "sess-2"))
+        self.assertEqual(self.provenance(1), ("user", "preference", self.SID))
+        self.assertEqual(self.provenance(2), ("user", "decision", "sess-2"))
 
     def test_items_without_valid_provenance_are_skipped(self):
         bad_items = [

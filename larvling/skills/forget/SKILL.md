@@ -7,9 +7,10 @@ disable-model-invocation: true
 
 **Schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
+- `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 
-Find the knowledge to remove — by ID, keyword, or by asking the user to clarify. Show matching item(s) and use AskUserQuestion to confirm before deleting. When deleting the last statement under a topic, delete the topic too.
+Find the knowledge to remove — by ID, keyword, or by asking the user to clarify. Search `current_statements`; superseded statements are history the user rarely means. Show matching item(s) and use AskUserQuestion to confirm before deleting. Deleting a statement that replaced an older one leaves the older one retired (its `superseded_by` becomes NULL, `superseded_at` stays). When deleting the last current statement under a topic, delete the topic too, together with its superseded statements: `DELETE FROM statements WHERE topic_id = N`, then the topic.
 
 Run SQL via:
 ```

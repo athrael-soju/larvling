@@ -89,7 +89,9 @@ Query the database to check for existing data before deciding actions:
 
 Six tables in 3 parent→child pairs:
 - `topics` (id INTEGER PK, title, domain, tags, created, updated)
-- `statements` (id INTEGER PK, topic_id INTEGER FK→topics(id), claim, created, updated, source, kind, session_id)
+- `statements` (id INTEGER PK, topic_id INTEGER FK→topics(id), claim, created, updated, source, kind, session_id, superseded_by, superseded_at)
+  - `current_statements`: a view of the statements still in force. Query it, not \
+`statements`, for existing knowledge; superseded statements are history.
 - `tasks` (id INTEGER PK, title, domain, status, priority, horizon, metadata, created)
 - `updates` (id INTEGER PK, task_id INTEGER FK→tasks(id), content, timestamp)
 - `sessions` (id TEXT PK, started_at, ended_at, duration_min, title, agent_summary, exchange_count, summary_at, summary_msg_count, tags)
@@ -156,11 +158,14 @@ Based on your query results from Phase 2, assign an action for each candidate.
 **Knowledge actions:**
 - **add_topic**: no existing overlap — create a new topic with its first statement
 - **add_statement**: related topic exists — add a new statement to it (include "topic_id")
-- **update_statement**: existing statement needs refinement (include "statement_id")
+- **supersede_statement**: a current statement is wrong, out of date or less precise \
+than the candidate — replace it (include its "statement_id"). The new claim goes into \
+the same topic and the old statement is kept as history. Use this for every correction: \
+never add a second statement that contradicts or "corrects" a current one.
 - **update_topic**: existing topic title/domain/tags need updating (include "topic_id")
 - **skip**: knowledge already exists unchanged — do NOT include it in the output
 
-Never delete data. To retire knowledge, update the statement or topic instead.
+Never delete data, and never rewrite a claim in place.
 
 **Task actions:**
 - **add_task**: a durable commitment that outlives this conversation and is not tracked \
@@ -177,7 +182,7 @@ new tags from this conversation.
 
 ## Output schema
 
-Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "about": "user|domain", "evidence": "...", "endorsement": "...", "action": "add_topic|add_statement|update_statement|update_topic", "topic_id": N, "statement_id": N}}
+Each knowledge item: {{"topic_title": "...", "claim": "...", "domain": "...", "tags": "...", "source": "user|agent", "kind": "fact|decision|preference|assessment", "about": "user|domain", "evidence": "...", "endorsement": "...", "action": "add_topic|add_statement|supersede_statement|update_topic", "topic_id": N, "statement_id": N}}
 - topic_title: the subject in a few words (e.g. "CI pipeline", "Octopuses"). Name the \
 subject only: a title never makes a claim about the user.
 - claim: only what the evidence says, with no inference, generalisation or detail \
@@ -240,7 +245,7 @@ EXTRACTION_SCHEMA = {
                         "enum": [
                             "add_topic",
                             "add_statement",
-                            "update_statement",
+                            "supersede_statement",
                             "update_topic",
                         ],
                     },
@@ -450,13 +455,13 @@ def _parse_provenance(item, action, session_id, user_texts, agent_texts):
 def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agent_texts=()):
     """Process extracted knowledge into topics+statements tables.
 
-    Handles 4 actions: add_topic, add_statement, update_statement, update_topic.
-    Each statement written gets a source, kind and session_id; updating a
-    statement replaces them.
+    Handles 4 actions: add_topic, add_statement, supersede_statement and
+    update_topic. Each statement written gets a source, kind and session_id.
+    A superseded statement is kept, pointing at the one that replaced it.
     *user_texts* and *agent_texts* are the messages (a list, or one string)
     the items came from, used to check each item's evidence.
     Never deletes data — retirement is done via updates, not removal.
-    Returns (topics_inserted, stmts_inserted, stmts_updated, topics_updated).
+    Returns (topics_inserted, stmts_inserted, stmts_superseded, topics_updated).
     """
     if not knowledge_list or not has_table(conn, "topics"):
         return 0, 0, 0, 0
@@ -465,7 +470,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
 
     topics_inserted = 0
     stmts_inserted = 0
-    stmts_updated = 0
+    stmts_superseded = 0
     topics_updated = 0
 
     for item in knowledge_list:
@@ -473,7 +478,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
         if action not in (
             "add_topic",
             "add_statement",
-            "update_statement",
+            "supersede_statement",
             "update_topic",
         ):
             continue
@@ -502,7 +507,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 topics_updated += 1
             continue
 
-        if action == "update_statement":
+        if action == "supersede_statement":
             stmt_id = _parse_id(
                 item.get("statement_id"), "statement_id", action, session_id
             )
@@ -515,17 +520,29 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
             provenance = _parse_provenance(item, action, session_id, user_texts, agent_texts)
             if provenance is None:
                 continue
-            if not conn.execute(
-                "SELECT 1 FROM statements WHERE id = ?", (stmt_id,)
-            ).fetchone():
+            old = conn.execute(
+                "SELECT topic_id, claim, superseded_at FROM statements WHERE id = ?",
+                (stmt_id,),
+            ).fetchone()
+            if not old:
                 _skip(session_id, action, "statement not found", statement_id=stmt_id)
                 continue
-            conn.execute(
-                "UPDATE statements SET claim = ?, source = ?, kind = ?, session_id = ?, "
-                "updated = datetime('now') WHERE id = ?",
-                (claim, *provenance, session_id, stmt_id),
+            if old["superseded_at"]:
+                _skip(session_id, action, "statement already superseded", statement_id=stmt_id)
+                continue
+            if old["claim"] == claim:
+                continue
+            cur = conn.execute(
+                "INSERT INTO statements (topic_id, claim, source, kind, session_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (old["topic_id"], claim, *provenance, session_id),
             )
-            stmts_updated += 1
+            conn.execute(
+                "UPDATE statements SET superseded_by = ?, superseded_at = datetime('now') "
+                "WHERE id = ?",
+                (cur.lastrowid, stmt_id),
+            )
+            stmts_superseded += 1
             continue
 
         if action == "add_statement":
@@ -546,7 +563,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
                 continue
             # Exact-match dedup safety net
             if conn.execute(
-                "SELECT 1 FROM statements WHERE topic_id = ? AND claim = ?",
+                "SELECT 1 FROM current_statements WHERE topic_id = ? AND claim = ?",
                 (topic_id, claim),
             ).fetchone():
                 continue
@@ -581,7 +598,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
 
         # Exact-match dedup on claim
         if conn.execute(
-            "SELECT 1 FROM statements WHERE claim = ?", (claim,)
+            "SELECT 1 FROM current_statements WHERE claim = ?", (claim,)
         ).fetchone():
             continue
 
@@ -598,7 +615,7 @@ def process_knowledge(conn, knowledge_list, session_id=None, user_texts=(), agen
         topics_inserted += 1
         stmts_inserted += 1
 
-    return topics_inserted, stmts_inserted, stmts_updated, topics_updated
+    return topics_inserted, stmts_inserted, stmts_superseded, topics_updated
 
 
 def process_tasks(conn, tasks_list, session_id=None):
@@ -908,9 +925,9 @@ def _store(session_id, token, chunk, result, cfg):
             return None
 
         # Knowledge (topics + statements)
-        topics_ins = stmts_ins = stmts_upd = topics_upd = 0
+        topics_ins = stmts_ins = stmts_sup = topics_upd = 0
         if cfg["knowledge_extraction"]:
-            topics_ins, stmts_ins, stmts_upd, topics_upd = process_knowledge(
+            topics_ins, stmts_ins, stmts_sup, topics_upd = process_knowledge(
                 conn, result.get("knowledge", []), session_id, user_texts, agent_texts
             )
 
@@ -938,8 +955,10 @@ def _store(session_id, token, chunk, result, cfg):
             k_parts.append(f"{topics_ins} topics")
         if stmts_ins:
             k_parts.append(f"{stmts_ins} statements")
-        if stmts_upd or topics_upd:
-            k_parts.append(f"{stmts_upd + topics_upd} updated")
+        if stmts_sup:
+            k_parts.append(f"{stmts_sup} superseded")
+        if topics_upd:
+            k_parts.append(f"{topics_upd} topics updated")
         t_parts = []
         if tasks_ins:
             t_parts.append(f"{tasks_ins} tasks")
@@ -954,7 +973,7 @@ def _store(session_id, token, chunk, result, cfg):
             f"Extraction: knowledge={_summary(k_parts, 'no changes')}, "
             f"{_summary(t_parts, 'no tasks')}",
         )
-    return topics_ins, stmts_ins, stmts_upd, topics_upd, tasks_ins, updates_ins, tasks_upd
+    return topics_ins, stmts_ins, stmts_sup, topics_upd, tasks_ins, updates_ins, tasks_upd
 
 
 def extract_chunk(session_id, token, chunk, part, cfg):
@@ -993,16 +1012,16 @@ def extract_chunk(session_id, token, chunk, part, cfg):
     if counts is None:
         log("extraction_skipped", session_id, reason="lease lost")
         return False
-    topics_ins, stmts_ins, stmts_upd, topics_upd, tasks_ins, updates_ins, tasks_upd = counts
+    topics_ins, stmts_ins, stmts_sup, topics_upd, tasks_ins, updates_ins, tasks_upd = counts
 
-    if topics_ins or stmts_ins or stmts_upd or topics_upd:
+    if topics_ins or stmts_ins or stmts_sup or topics_upd:
         k_data = {}
         if topics_ins:
             k_data["topics_inserted"] = topics_ins
         if stmts_ins:
             k_data["stmts_inserted"] = stmts_ins
-        if stmts_upd:
-            k_data["stmts_updated"] = stmts_upd
+        if stmts_sup:
+            k_data["stmts_superseded"] = stmts_sup
         if topics_upd:
             k_data["topics_updated"] = topics_upd
         log("knowledge", session_id, **k_data)

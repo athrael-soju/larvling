@@ -118,7 +118,7 @@ def has_table(conn, name):
 # Schema creation and versioning
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 def get_schema_version(conn):
@@ -135,7 +135,7 @@ def get_current_schema(conn):
     """Read the live schema from sqlite_master."""
     rows = conn.execute(
         "SELECT sql FROM sqlite_master "
-        "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'"
+        "WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
     return "\n".join(row[0] + ";" for row in rows if row[0])
 
@@ -148,6 +148,14 @@ def get_desired_schema():
     schema = get_current_schema(mem)
     mem.close()
     return schema
+
+
+# Statements still in force. A statement leaves it when it is superseded
+# (superseded_by names its replacement) or retired with no replacement.
+CURRENT_STATEMENTS_VIEW = (
+    "CREATE VIEW IF NOT EXISTS current_statements AS "
+    "SELECT * FROM statements WHERE superseded_at IS NULL"
+)
 
 
 def create_schema(conn):
@@ -206,7 +214,9 @@ def create_schema(conn):
             updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             source TEXT CHECK(source IN ('user', 'agent', 'doc', 'manual')),
             kind TEXT CHECK(kind IN ('fact', 'decision', 'preference', 'assessment')),
-            session_id TEXT REFERENCES sessions(id)
+            session_id TEXT REFERENCES sessions(id),
+            superseded_by INTEGER REFERENCES statements(id) ON DELETE SET NULL,
+            superseded_at TEXT
         )
     """
     )
@@ -247,6 +257,10 @@ def create_schema(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_statements_session ON statements(session_id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_superseded_by ON statements(superseded_by)"
+    )
+    conn.execute(CURRENT_STATEMENTS_VIEW)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
     )

@@ -23,6 +23,7 @@ from db import (
     set_schema_version,
     get_current_schema,
     get_desired_schema,
+    CURRENT_STATEMENTS_VIEW,
 )
 
 
@@ -166,11 +167,26 @@ def migrate_v14_to_v15(conn):
     return {"sessions_marked_extracted": cur.rowcount}
 
 
+def migrate_v15_to_v16(conn):
+    """v16: statements are superseded instead of rewritten; current_statements
+    lists the ones still in force."""
+    conn.execute(
+        "ALTER TABLE statements ADD COLUMN "
+        "superseded_by INTEGER REFERENCES statements(id) ON DELETE SET NULL"
+    )
+    conn.execute("ALTER TABLE statements ADD COLUMN superseded_at TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_statements_superseded_by ON statements(superseded_by)"
+    )
+    conn.execute(CURRENT_STATEMENTS_VIEW)
+
+
 # Schema version -> the step that upgrades it by one. Don't change a step
 # after release; add a new one.
 MIGRATIONS = {
     13: migrate_v13_to_v14,
     14: migrate_v14_to_v15,
+    15: migrate_v15_to_v16,
 }
 
 

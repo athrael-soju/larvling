@@ -6,9 +6,12 @@ argument-hint: "[search term]"
 
 **Schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
+- `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 
 Search for relevant knowledge by keyword, topic, or any available context. Use JOINs to show topic context with statements.
+
+Search `current_statements`, not `statements`: it leaves out statements that were superseded or retired. Only when the user asks how something changed, show the history from `statements`: the rows with `superseded_by = <id>` are the claims a statement replaced.
 
 Leave out assessments by default: add `s.kind IS NOT 'assessment'` to the `WHERE` clause (`IS NOT` keeps older statements whose `kind` is NULL). Assessments are agent judgements the user agreed with, not established facts. Include them only when the user asks for opinions, recommendations or assessments, or for everything; then mark each one `(assessment)`.
 

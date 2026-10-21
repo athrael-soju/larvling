@@ -69,7 +69,7 @@ def inject_context(conn, session_id):
     if cfg["context_hints"] and has_table(conn, "topics"):
         topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
         stmt_count = (
-            conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM current_statements").fetchone()[0]
             if has_table(conn, "statements")
             else 0
         )
