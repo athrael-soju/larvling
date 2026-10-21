@@ -150,21 +150,29 @@ def migrate_v14_to_v15(conn):
     conn.execute("ALTER TABLE sessions ADD COLUMN extracted_at TEXT")
     conn.execute("ALTER TABLE sessions ADD COLUMN extracted_through INTEGER")
     conn.execute("ALTER TABLE sessions ADD COLUMN extract_lease TEXT")
-    cur = conn.execute(
-        """
-        UPDATE sessions SET
-            extracted_through = (
-                SELECT MAX(m.id) FROM messages m
-                WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
-            ),
-            extracted_at = datetime('now')
-        WHERE EXISTS (
-            SELECT 1 FROM messages m
-            WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
-        )
-        """
-    )
+    cur = conn.execute(MARK_EXTRACTED)
     return {"sessions_marked_extracted": cur.rowcount}
+
+
+MARK_EXTRACTED = """
+UPDATE sessions SET
+    extracted_through = (
+        SELECT MAX(m.id) FROM messages m
+        WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+    ),
+    extracted_at = datetime('now')
+WHERE extracted_through IS NULL AND EXISTS (
+    SELECT 1 FROM messages m
+    WHERE m.session_id = sessions.id AND m.role IN ('user', 'assistant')
+)
+""".strip()
+
+# Schema version -> data an upgrade to it carries over, for a migration done
+# by hand. The automatic steps above run the same SQL.
+DATA_STEPS = {
+    15: ("Earlier versions extracted after every exchange, so count every "
+         "message already recorded as extracted", MARK_EXTRACTED),
+}
 
 
 def migrate_v15_to_v16(conn):
@@ -325,7 +333,14 @@ def ensure_schema():
         + safe_path
         + "` from the current schema to the desired schema."
     )
-    print("Preserve all existing data. After migrating, run:")
+    steps = [DATA_STEPS[v] for v in sorted(DATA_STEPS) if v > db_version]
+    if steps:
+        print("Preserve all existing data, and once the new columns exist:")
+        for why, sql in steps:
+            print(f"- {why}:\n```sql\n{sql};\n```")
+        print("After migrating, run:")
+    else:
+        print("Preserve all existing data. After migrating, run:")
     print(
         f"```bash\n{py} -c \"import sqlite3; c=sqlite3.connect('{safe_path}'); c.execute('PRAGMA user_version={SCHEMA_VERSION}'); c.close()\"\n```"
     )

@@ -7,6 +7,8 @@ the results to SQLite. A long session is extracted in chunks, one call each.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import re
@@ -16,13 +18,16 @@ import unicodedata
 
 from config import get_config
 from db import (
+    SCHEMA_VERSION,
     open_db,
     has_table,
+    get_schema_version,
     record_message,
     log,
 )
 from hooks_util import run_detached_or_inline
 from sdk import call_model
+from transcript import agent_prompts
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +71,11 @@ CHUNK_CHARS = 60000
 MESSAGE_CHARS = 8000
 # A worker holds a session for this long; a crashed worker's claim expires.
 LEASE_MINUTES = 15
+# How often a SessionEnd worker checks whether a running worker let go.
+CLAIM_POLL_SECONDS = 5
 # SessionStart catch-up leaves a session alone until it has been quiet this
-# long, so a session still running in another terminal isn't cut in half.
+# long, in the DB and in its transcript, so a session still running in
+# another terminal isn't cut in half.
 CATCH_UP_IDLE_MINUTES = 10
 
 
@@ -819,7 +827,8 @@ def _lease_free(column="extract_lease"):
 def claim_session(conn, session_id):
     """Take the session's extraction lease.
 
-    Returns the lease token, or None if another worker holds a live one.
+    Returns the lease token, or None if another worker holds a live one or
+    the session has no row.
     """
     token = _lease_token()
     cur = conn.execute(
@@ -848,6 +857,40 @@ def release_claim(conn, session_id, token):
         (session_id, token),
     )
     conn.commit()
+
+
+def relabel_agent_prompts(conn, session_id, texts):
+    """Mark the session's unextracted 'user' messages whose text Claude Code or
+    an agent wrote (*texts*, from transcript.agent_prompts) as 'system'.
+
+    The Stop hook does this for its own turn, but extraction can run before
+    it does: at PreCompact, after an interrupted turn, or for a crashed
+    session. Words the user added mid-turn are left alone.
+    """
+    if not texts:
+        return 0
+    rows = conn.execute(
+        "SELECT m.id, m.content FROM messages m JOIN sessions s ON s.id = m.session_id "
+        "WHERE m.session_id = ? AND m.role = 'user' "
+        "AND m.id > COALESCE(s.extracted_through, 0) "
+        "AND NOT COALESCE(CASE WHEN json_valid(m.metadata) "
+        "THEN json_extract(m.metadata, '$.mid_turn') END, 0)",
+        (session_id,),
+    ).fetchall()
+    ids = [r[0] for r in rows if (r[1] or "").strip() in texts]
+    for mid in ids:
+        conn.execute("UPDATE messages SET role = 'system' WHERE id = ?", (mid,))
+    conn.commit()
+    return len(ids)
+
+
+def answered(messages):
+    """Leave out the messages after the last agent reply: a prompt that is
+    still being answered is extracted later, with its answer."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i][1] == "assistant":
+            return messages[: i + 1]
+    return []
 
 
 def pending_messages(conn, session_id):
@@ -889,15 +932,18 @@ def chunk_messages(messages, budget=None):
     """Split messages into chunks whose text in the prompt fits *budget*
     (CHUNK_CHARS by default).
 
-    A chunk that ends on a user message hands it to the next chunk, so a
-    question and its answer stay together.
+    A chunk that ends on user messages (a prompt, and what the user added
+    while it was answered) hands them to the next chunk, so a question and
+    its answer stay together.
     """
     budget = budget or CHUNK_CHARS
     chunks, current, size = [], [], 0
     for message in messages:
         length = min(len(message[2] or ""), MESSAGE_CHARS)
         if current and size + length > budget:
-            carry = [current.pop()] if len(current) > 1 and current[-1][1] == "user" else []
+            carry = []
+            while len(current) > 1 and current[-1][1] == "user":
+                carry.insert(0, current.pop())
             chunks.append(current)
             current = carry
             size = sum(min(len(m[2] or ""), MESSAGE_CHARS) for m in carry)
@@ -1056,60 +1102,155 @@ def extract_chunk(session_id, token, chunk, part, cfg):
     return True
 
 
-def extract_session(session_id, cfg=None):
-    """Extract every message the session recorded since its last extraction.
+def _claim(session_id, wait):
+    """Take the session's lease, waiting up to LEASE_MINUTES for a running
+    worker to let go when *wait*. Returns the token, or None."""
+    deadline = time.monotonic() + (LEASE_MINUTES * 60 + CLAIM_POLL_SECONDS if wait else 0)
+    while True:
+        with open_db() as conn:
+            token = claim_session(conn, session_id)
+            if token is not None:
+                return token
+            if not conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone():
+                return None  # nothing recorded: no session to extract
+        if time.monotonic() >= deadline:
+            log("extraction_skipped", session_id, reason="session already being extracted")
+            return None
+        time.sleep(CLAIM_POLL_SECONDS)
+
+
+def extract_session(session_id, cfg=None, transcript_path=None, final=True, wait=False):
+    """Extract the messages the session recorded since its last extraction.
 
     Takes the session's lease first, so two workers never extract the same
-    session at once; messages recorded while it runs are picked up before it
-    lets go. Returns the number of chunks stored.
+    session at once; with *wait*, it waits for a running worker to finish
+    instead of leaving. Works on the messages pending when it starts, in one
+    pass. Unless *final*, a prompt still being answered is left for later.
+    Prompts in *transcript_path* that the user didn't write are relabelled
+    first. Returns the number of chunks stored.
     """
     cfg = cfg or get_config()
-    with open_db() as conn:
-        token = claim_session(conn, session_id)
+    token = _claim(session_id, wait)
     if token is None:
-        log("extraction_skipped", session_id, reason="session already being extracted")
         return 0
 
     stored = 0
     try:
-        while True:
+        with open_db() as conn:
+            relabel_agent_prompts(conn, session_id, agent_prompts(transcript_path))
+            messages = pending_messages(conn, session_id)
+        if not final:
+            messages = answered(messages)
+        chunks = chunk_messages(messages)
+        for n, chunk in enumerate(chunks, 1):
             with open_db() as conn:
-                messages = pending_messages(conn, session_id)
-            if not messages:
-                return stored
-            chunks = chunk_messages(messages)
-            for n, chunk in enumerate(chunks, 1):
-                with open_db() as conn:
-                    token = renew_claim(conn, session_id, token)
-                if token is None or not extract_chunk(
-                    session_id, token, chunk, (n, len(chunks)), cfg
-                ):
-                    return stored
-                stored += 1
+                token = renew_claim(conn, session_id, token)
+            if token is None or not extract_chunk(
+                session_id, token, chunk, (n, len(chunks)), cfg
+            ):
+                break
+            stored += 1
+        return stored
     finally:
         if token is not None:
             with open_db() as conn:
                 release_claim(conn, session_id, token)
 
 
+def mark_extracted(conn, session_id):
+    """Count everything the session recorded as extracted, without a model call."""
+    conn.execute(
+        "UPDATE sessions SET extracted_through = MAX(COALESCE(extracted_through, 0), "
+        "COALESCE((SELECT MAX(id) FROM messages WHERE session_id = ?), 0)), "
+        "extracted_at = datetime('now') WHERE id = ?",
+        (session_id, session_id),
+    )
+    conn.commit()
+
+
+def _transcript(data, session_id):
+    """Path of *session_id*'s transcript: Claude Code keeps a project's
+    transcripts side by side, named after the session."""
+    path = data.get("transcript_path")
+    if not path:
+        return None
+    path = os.path.join(os.path.dirname(path), f"{session_id}.jsonl")
+    return path if os.path.exists(path) else None
+
+
+def _recently_written(path, minutes):
+    try:
+        return time.time() - os.path.getmtime(path) < minutes * 60
+    except (OSError, TypeError):
+        return False
+
+
+def _schema_ready(session_id):
+    """Make sure the DB has this version's schema, migrating it if the
+    session's own start couldn't (another session held the DB).
+
+    Messages already recorded count as extracted after a migration, since
+    the code before v15 extracted after every exchange. This session's
+    weren't, after its last "Extraction:" message, so they are reopened.
+    """
+    with open_db() as conn:
+        if get_schema_version(conn) == SCHEMA_VERSION:
+            return True
+    import preflight
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        status = preflight.ensure_schema()
+    if status not in ("fresh", "current", "migrated"):
+        log("extraction_error", session_id, context="schema",
+            error=f"database not at schema v{SCHEMA_VERSION} ({status})")
+        return False
+    if status == "migrated" and session_id:
+        with open_db() as conn:
+            conn.execute(
+                "UPDATE sessions SET extracted_through = ("
+                "SELECT MAX(id) FROM messages WHERE session_id = :s "
+                "AND role IN ('user', 'assistant') AND id < ("
+                "SELECT MAX(id) FROM messages WHERE session_id = :s "
+                "AND role = 'system' AND content LIKE 'Extraction:%')) WHERE id = :s",
+                {"s": session_id},
+            )
+    return True
+
+
 def _run(data):
     """Detached worker: extract the hook's session, or catch up earlier ones.
 
-    SessionEnd and PreCompact pass their payload; SessionStart passes
-    ``catch_up`` with the session that is starting, which is left alone.
+    SessionEnd extracts everything, waiting for a PreCompact worker that is
+    still running; PreCompact leaves the prompt being answered for later.
+    SessionStart passes ``catch_up`` with the session that is starting, which
+    is left alone, as is any session whose transcript is still being written.
+    With analysis off, the session is marked extracted, so turning it back on
+    doesn't extract everything recorded in between.
     """
+    session_id = data.get("session_id")
+    if not _schema_ready(None if data.get("catch_up") else session_id):
+        return
     cfg = get_config()
     if not cfg["analysis"]:
+        if session_id and not data.get("catch_up"):
+            with open_db() as conn:
+                mark_extracted(conn, session_id)
         return
 
-    session_id = data.get("session_id")
     if data.get("catch_up"):
         with open_db() as conn:
             pending = pending_sessions(conn, exclude=session_id)
         for sid in pending:
-            extract_session(sid, cfg)
+            path = _transcript(data, sid)
+            if _recently_written(path, CATCH_UP_IDLE_MINUTES):
+                continue
+            extract_session(sid, cfg, path)
     elif session_id:
-        extract_session(session_id, cfg)
+        precompact = data.get("hook_event_name") == "PreCompact"
+        extract_session(
+            session_id, cfg, data.get("transcript_path"),
+            final=not precompact, wait=not precompact,
+        )
 
 
 if __name__ == "__main__":

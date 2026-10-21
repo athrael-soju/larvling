@@ -35,26 +35,36 @@ def handle(data):
         with open_db() as conn:
             ensure_session(conn, session_id)
 
-            # Extraction takes 'user' messages as the user's own words. A
-            # prompt Claude Code submitted for the user (a scheduled task, a
-            # message from another session) is recorded as one, so relabel it.
-            if prompt and not by_user:
-                conn.execute(
-                    "UPDATE messages SET role = 'system' WHERE id = ("
-                    "SELECT MAX(id) FROM messages WHERE session_id = ? AND role = 'user'"
-                    ") AND content = ?",
-                    (session_id, prompt.strip()),
-                )
-
-            # A reply that is already the last one recorded means this turn
-            # was recorded before.
-            row = conn.execute(
-                "SELECT content FROM messages "
+            last_reply = conn.execute(
+                "SELECT id, content FROM messages "
                 "WHERE session_id = ? AND role = 'assistant' "
                 "ORDER BY id DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
-            is_dup = bool(response and row and row[0] == response)
+            since = last_reply[0] if last_reply else 0
+
+            # Extraction takes 'user' messages as the user's own words. A
+            # prompt Claude Code submitted for the user (a scheduled task, a
+            # message from another session) is recorded as one, so relabel it:
+            # this turn's, recorded after the last reply.
+            if prompt and not by_user:
+                conn.execute(
+                    "UPDATE messages SET role = 'system' WHERE id = ("
+                    "SELECT MAX(id) FROM messages WHERE session_id = ? AND role = 'user' "
+                    "AND id > ?) AND content = ?",
+                    (session_id, since, prompt.strip()),
+                )
+
+            # The reply already recorded last, with no prompt since, means
+            # this turn was recorded before. The same reply to a new prompt
+            # is a new turn.
+            prompted = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND role = 'user' AND id > ?",
+                (session_id, since),
+            ).fetchone()
+            is_dup = bool(
+                response and last_reply and last_reply[1] == response and not prompted
+            )
 
             if not is_dup:
                 # Queued messages, AskUserQuestion answers and rejection
@@ -64,9 +74,8 @@ def handle(data):
                     r[0]
                     for r in conn.execute(
                         "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
-                        "AND id > COALESCE((SELECT MAX(id) FROM messages "
-                        "WHERE session_id = ? AND role = 'assistant'), 0)",
-                        (session_id, session_id),
+                        "AND id > ?",
+                        (session_id, since),
                     )
                 }
                 for text in mid_turn:
