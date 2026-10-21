@@ -60,7 +60,7 @@ def inject_context(conn, session_id):
     if cfg["context_hints"] and has_table(conn, "topics"):
         topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
         stmt_count = (
-            conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM current_statements").fetchone()[0]
             if has_table(conn, "statements")
             else 0
         )
@@ -75,7 +75,7 @@ def inject_context(conn, session_id):
             f'query: {py} "{query_script}" "<SQL>"\n'
             "When the answer depends on stored knowledge not already in context, "
             "retrieve it and weave it in. Prefer `/recall <term>`; use raw SQL only "
-            "for aggregates/joins it can't do. SQL hits large tables (statements, "
+            "for aggregates/joins it can't do. SQL hits large tables (current_statements, "
             "tasks, messages) — so select only the columns you need (`substr(claim,1,160)` "
             "for long text) and let the question itself size the result: filter narrowly, "
             "and add a `LIMIT` only when the answer would otherwise be excessive, not by "

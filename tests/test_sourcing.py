@@ -234,9 +234,9 @@ class SourcingRulesTest(unittest.TestCase):
         self.stored([stated], STATED_USER, STATED_AGENT)
         # A later exchange can't rewrite the user's fact with the agent's words.
         rewrites = [
-            item(action="update_statement", statement_id=1, claim="Works solo with one workflow file",
+            item(action="supersede_statement", statement_id=1, claim="Works solo with one workflow file",
                  evidence="one workflow file is plenty"),
-            item(action="update_statement", statement_id=1, claim="Works solo with one workflow file",
+            item(action="supersede_statement", statement_id=1, claim="Works solo with one workflow file",
                  source="agent", evidence="one workflow file is plenty"),
         ]
         self.assertEqual(

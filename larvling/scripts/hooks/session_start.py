@@ -264,7 +264,7 @@ def get_session_context():
         stmt_count = 0
         if has_table(conn, "topics"):
             topic_count = conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0]
-            stmt_count = conn.execute("SELECT COUNT(*) FROM statements").fetchone()[0] if has_table(conn, "statements") else 0
+            stmt_count = conn.execute("SELECT COUNT(*) FROM current_statements").fetchone()[0] if has_table(conn, "statements") else 0
             if topic_count:
                 domain_rows = conn.execute(
                     "SELECT COALESCE(domain, 'unset') as d, COUNT(*) as c "
@@ -273,10 +273,11 @@ def get_session_context():
                 domains = ", ".join(
                     f"{r['d']} ({r['c']})" for r in domain_rows
                 )
-                # Leave out assessments: they are opinions, not facts.
+                # Leave out assessments (opinions, not facts) and statements
+                # that were superseded.
                 recent = conn.execute(
                     "SELECT t.id, t.title, s.id as sid, s.claim "
-                    "FROM topics t JOIN statements s ON s.topic_id = t.id "
+                    "FROM topics t JOIN current_statements s ON s.topic_id = t.id "
                     "WHERE s.kind IS NOT 'assessment' "
                     "ORDER BY s.updated DESC, s.created DESC LIMIT 5"
                 ).fetchall()

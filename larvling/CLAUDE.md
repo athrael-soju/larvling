@@ -50,10 +50,11 @@ A backup of the database has already been created.
    - `BEGIN TRANSACTION`
    - `CREATE TABLE <new_table> (...)` with the correct schema
    - `INSERT INTO <new_table> SELECT ... FROM <old_table>`
+   - `DROP VIEW` every view that reads the old table (e.g. `current_statements` reads `statements`) — otherwise the rename fails with `error in view ...: no such table`
    - `DROP TABLE <old_table>`
    - `ALTER TABLE <new_table> RENAME TO <old_table>`
    - Rebuild **every table** that has a FK referencing the rebuilt table (same pattern)
-   - Rebuild any indexes/triggers on affected tables
+   - Rebuild any indexes/triggers on affected tables, and recreate the dropped views from the desired schema
    - `PRAGMA foreign_key_check` — must return zero rows
    - `COMMIT`
    - `PRAGMA foreign_keys = ON`
@@ -69,7 +70,8 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 - `sessions (id TEXT PK, started_at TEXT, ended_at TEXT, duration_min REAL, title TEXT, agent_summary TEXT, exchange_count INT, summary_at TEXT, summary_msg_count INT, tags TEXT, summary_offered INT DEFAULT 0, extracted_at TEXT, extracted_through INT, extract_lease TEXT)`
 - `messages (id INT PK AUTO, session_id TEXT FK, timestamp TEXT, role TEXT [user|assistant|system], content TEXT, metadata TEXT)`
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
+- `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 - `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT DEFAULT 'open', priority TEXT DEFAULT 'medium', horizon TEXT DEFAULT 'later', metadata TEXT, created TEXT, updated TEXT)`
 - `updates (id INTEGER PK AUTO, task_id INTEGER FK→tasks(id), content TEXT NOT NULL, timestamp TEXT)`
 
@@ -93,7 +95,7 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 ```
 /query "SELECT horizon, priority, COUNT(*) AS n FROM tasks WHERE status='open' GROUP BY horizon, priority"   -- briefing: bounded rollup, can't truncate
 /query "SELECT id, title, horizon FROM tasks WHERE status='open' AND horizon='now' ORDER BY priority"   -- drill into the 'now' slice: the scope bounds it, no LIMIT
-/query "SELECT t.id, t.title, substr(s.claim,1,160) AS claim FROM topics t JOIN statements s ON s.topic_id=t.id WHERE s.claim LIKE '%deploy%' AND s.kind IS NOT 'assessment' LIMIT 10"   -- keyword search, narrowed cells
+/query "SELECT t.id, t.title, substr(s.claim,1,160) AS claim FROM topics t JOIN current_statements s ON s.topic_id=t.id WHERE s.claim LIKE '%deploy%' AND s.kind IS NOT 'assessment' LIMIT 10"   -- keyword search, narrowed cells
 /query "SELECT id, title, agent_summary FROM sessions WHERE agent_summary IS NOT NULL ORDER BY started_at DESC LIMIT 5"
 /query "SELECT id, role, substr(content,1,160) AS content FROM messages WHERE content LIKE '%auth%' LIMIT 10" --json
 ```
@@ -103,7 +105,8 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 | Table | Key columns |
 |-------|-------------|
 | topics | id, title, domain, tags |
-| statements | id, topic_id, claim, source, kind, session_id |
+| statements | id, topic_id, claim, source, kind, session_id, superseded_by, superseded_at |
+| current_statements (view) | same as statements, only those still in force |
 | tasks | id, title, status, priority, horizon, metadata |
 | sessions | id, started_at, title, agent_summary |
 | messages | id, session_id, role, content |
@@ -113,10 +116,12 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 
 Larvling stores persistent knowledge in the `topics` + `statements` tables, and action items in the `tasks` + `updates` tables. Multiple mechanisms handle data extraction:
 
-**UserPromptSubmit → Knowledge Context (read):** The `## Knowledge Context` directive prints on every exchange with the `query.py` path and topic/statement counts. When the question depends on stored knowledge, recall it and weave it in — but keep reads bounded: prefer the `/recall <term>` skill, or a keyword-filtered query (`claim`/`title`/`tags LIKE`) sized to the question — add a `LIMIT` only if the keyword is broad enough to match a lot. Don't run an unfiltered `SELECT ... FROM statements`, pull whole topics/domains, or dump the table to a file; narrow the keyword instead of widening the pull. Leave out `kind = 'assessment'` rows (`s.kind IS NOT 'assessment'`) unless the user asks for opinions or recommendations: they are agent judgements the user agreed with, not facts.
+**Supersession:** a statement is never rewritten in place. When a claim is corrected or goes out of date, a new statement replaces it: the old row gets `superseded_by` (the replacement's id) and `superseded_at`, and stays for history. A statement retired with nothing to replace it gets `superseded_at` alone. Read knowledge from the `current_statements` view, which leaves both out; query `statements` only for history, e.g. the chain behind a claim: `SELECT id, claim, superseded_at FROM statements WHERE superseded_by = <id>`.
+
+**UserPromptSubmit → Knowledge Context (read):** The `## Knowledge Context` directive prints on every exchange with the `query.py` path and topic/statement counts. When the question depends on stored knowledge, recall it and weave it in — but keep reads bounded: prefer the `/recall <term>` skill, or a keyword-filtered query (`claim`/`title`/`tags LIKE`) sized to the question — add a `LIMIT` only if the keyword is broad enough to match a lot. Read from `current_statements`, not `statements`, unless the user asks how a claim changed. Don't run an unfiltered `SELECT ... FROM current_statements`, pull whole topics/domains, or dump the table to a file; narrow the keyword instead of widening the pull. Leave out `kind = 'assessment'` rows (`s.kind IS NOT 'assessment'`) unless the user asks for opinions or recommendations: they are agent judgements the user agreed with, not facts.
 
 **SessionEnd / PreCompact → Session extraction (write):** `analyze.py` runs once per session, in a detached process started by the SessionEnd hook, and again before each compaction (leaving a prompt still being answered for later, so it is extracted with its answer). It reads the user and agent messages the session recorded since its last extraction (`sessions.extracted_through`), relabelling first any prompt the transcript shows Claude Code or an agent wrote, and calls `sdk.py` (`call_model()`, model from the `model` config key) with the whole conversation, so a claim the user corrects later in the session is stored only in its corrected form. A long session is split into chunks of about 60k characters, one call each. The Stop hook only records: the reply, and as user messages anything the user added while the agent worked (queued messages, AskUserQuestion answers, feedback on a rejected tool call). At SessionStart, `session_start.py` catches up on earlier sessions that still have unextracted messages and have been quiet for 10 minutes, in the DB and in their transcript (a crash, a closed terminal, a failed call). A lease on the session (`sessions.extract_lease`) keeps two workers from extracting it at once; the SessionEnd worker waits for one that is still running. With `analysis` off, SessionEnd marks the session extracted, so turning it back on doesn't extract what was recorded in between. The extraction agent has Bash tool access to query all 6 tables for dedup — given the full schema, it decides what queries to run. Each call extracts multiple data types:
-- **Knowledge** → `topics` + `statements` tables (hierarchical: topic groups related statements). Actions: `add_topic`, `add_statement`, `update_statement`, `update_topic`. Every statement records its provenance: `source` (`user` or `agent` for extraction, `manual` for `/remember`), `kind` (`fact`, `decision`, `preference`, `assessment`) and the `session_id` that produced it. Statements stored before provenance existed have NULL `source`/`kind`, and a `session_id` only where it could be recovered from the message log. Extraction enforces where knowledge may come from. Anything about the user, their work or the people they deal with comes from the user's own words: their prompt, plus what they add while the agent works (queued messages, AskUserQuestion answers, feedback on a rejected tool call). From the agent, only general domain facts are kept, plus judgements the user explicitly agreed with, stored as `assessment`. Each item must quote its evidence, and an item whose quote isn't in a message from the speaker it names is dropped. The check proves the quote is there, not that it supports the claim: the prompt asks for claims that say no more than their evidence, and that is all that stops an inference built on a real quote. Assessments stay out of the session-start briefing and default `/recall`.
+- **Knowledge** → `topics` + `statements` tables (hierarchical: topic groups related statements). Actions: `add_topic`, `add_statement`, `supersede_statement` (replaces a current statement that is wrong, out of date or less precise; the old one is kept as history), `update_topic`. Every statement records its provenance: `source` (`user` or `agent` for extraction, `manual` for `/remember`), `kind` (`fact`, `decision`, `preference`, `assessment`) and the `session_id` that produced it. Statements stored before provenance existed have NULL `source`/`kind`, and a `session_id` only where it could be recovered from the message log. Extraction enforces where knowledge may come from. Anything about the user, their work or the people they deal with comes from the user's own words: their prompt, plus what they add while the agent works (queued messages, AskUserQuestion answers, feedback on a rejected tool call). From the agent, only general domain facts are kept, plus judgements the user explicitly agreed with, stored as `assessment`. Each item must quote its evidence, and an item whose quote isn't in a message from the speaker it names is dropped. The check proves the quote is there, not that it supports the claim: the prompt asks for claims that say no more than their evidence, and that is all that stops an inference built on a real quote. Assessments stay out of the session-start briefing and default `/recall`.
 - **Session tags** → `sessions.tags` column, comma-separated, consolidated at each extraction. The agent queries current tags itself.
 - **Tasks** → `tasks` + `updates` tables. Actions: `add_task`, `add_update` (attach context/notes), `update_task` (modify status/priority/horizon with reason). Invalid fields skip the item and log to JSONL — no silent coercion.
 

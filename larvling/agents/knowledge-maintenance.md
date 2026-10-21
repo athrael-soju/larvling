@@ -13,7 +13,8 @@ SQLite database at `.claude/larvling.db`.
 
 **Knowledge schema:**
 - `topics (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, tags TEXT NOT NULL, created TEXT, updated TEXT)`
-- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id))`
+- `statements (id INTEGER PK AUTO, topic_id INTEGER FK→topics(id), claim TEXT NOT NULL, created TEXT, updated TEXT, source TEXT [user|agent|doc|manual], kind TEXT [fact|decision|preference|assessment], session_id TEXT FK→sessions(id), superseded_by INTEGER FK→statements(id), superseded_at TEXT)`
+- `current_statements` — view: the statements still in force (`superseded_at IS NULL`), same columns
 
 **Tasks schema:**
 - `tasks (id INTEGER PK AUTO, title TEXT NOT NULL, domain TEXT NOT NULL, status TEXT CHECK IN ('open','done','dropped'), priority TEXT CHECK IN ('low','medium','high'), horizon TEXT CHECK IN ('now','soon','later'), metadata TEXT, created TEXT, updated TEXT)`
@@ -48,7 +49,7 @@ Run the three phases in order. Within each phase, query first, then group findin
 
 ### Phase 1 — Knowledge (topics + statements)
 
-1. **Query** all topics joined to their statements.
+1. **Query** all topics joined to their statements from `current_statements` (superseded statements are history, not knowledge to audit).
 2. **Identify issues**:
    - **Duplicate/overlapping topics**: similar titles or domains that should be merged
    - **Redundant statements**: same claim appearing under different topics
@@ -56,16 +57,24 @@ Run the three phases in order. Within each phase, query first, then group findin
    - **Misclassified domains**: topics assigned to the wrong domain
    - **Poor tag quality**: missing, inconsistent, or unhelpful tags
    - **Contradictory statements**: claims that conflict with each other
-   - **Empty topics**: topics with no statements
+   - **Empty topics**: topics with no current statements
 3. **Apply** (after approval):
    - **Merge topics**: reassign statements, then rename the retired topic:
      ```sql
      UPDATE statements SET topic_id = <surviving_id> WHERE topic_id = <retired_id>;
      UPDATE topics SET title = '[Merged into #<surviving_id>] ' || title WHERE id = <retired_id>;
      ```
-   - **Retire statements**: update the claim text to reflect current state
+   - **Never rewrite a claim in place.** Every change to a claim goes through supersession, so the history stays queryable.
+   - **Resolve contradictions / correct stale claims**: add the corrected statement and supersede the outdated one. The corrected wording is yours, so it is recorded as `manual` in this session, not with the old statement's provenance. Run the two separately (each `query.py` call is its own connection, so `last_insert_rowid()` won't work across them); the guards make the second a no-op when the old statement is already superseded or the insert failed:
+     ```sql
+     INSERT INTO statements (topic_id, claim, source, kind, session_id) SELECT topic_id, '<corrected claim>', 'manual', kind, (SELECT id FROM sessions WHERE id = '<session id>') FROM statements WHERE id = <old_id>;
+     UPDATE statements SET superseded_by = (SELECT MAX(id) FROM current_statements WHERE claim = '<corrected claim>' AND id != <old_id>), superseded_at = datetime('now') WHERE id = <old_id> AND superseded_at IS NULL AND EXISTS (SELECT 1 FROM current_statements WHERE claim = '<corrected claim>' AND id != <old_id>);
+     ```
+     `<session id>` is the one `/tidy` passed you; leave the subquery as written if you weren't given one (it stores NULL).
+   - **Redundant statements**: supersede the duplicate with the survivor: `UPDATE statements SET superseded_by = <survivor_id>, superseded_at = datetime('now') WHERE id = <duplicate_id> AND superseded_at IS NULL AND <survivor_id> != <duplicate_id> AND EXISTS (SELECT 1 FROM current_statements WHERE id = <survivor_id>)`
+   - **Retire statements** that are no longer true and have no replacement: `UPDATE statements SET superseded_at = datetime('now') WHERE id = <id> AND superseded_at IS NULL`
+   - Any of these reporting `0 row(s) affected` means a guard stopped it: the statement was already superseded, or its replacement isn't current. Re-query before trying again.
    - **Reclassify**: update `domain` or `tags` on the topic
-   - **Resolve contradictions**: update the outdated statement's claim
 
 ### Phase 2 — Tasks (tasks + updates)
 
@@ -126,7 +135,7 @@ Report a structured summary per phase. Do not ask further questions — the skil
 ## Guidelines
 
 - Use AskUserQuestion to confirm before making any changes. Group findings by phase to keep the menu short.
-- **Never delete rows.** Knowledge merges via statement reassignment + topic renaming. Tasks retire via `status = 'dropped'` + audit update. Sessions are flagged only.
+- **Never delete rows.** Knowledge merges via statement reassignment + topic renaming; claims change only through supersession. Tasks retire via `status = 'dropped'` + audit update. Sessions are flagged only.
 - All enum columns must match their CHECK constraints exactly:
   - `tasks.status` ∈ {`open`, `done`, `dropped`}
   - `tasks.priority` ∈ {`low`, `medium`, `high`}
