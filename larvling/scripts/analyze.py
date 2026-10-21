@@ -532,7 +532,7 @@ def process_tasks(conn, tasks_list, session_id=None):
     tasks_updated = 0
 
     for task in tasks_list:
-        action = task.get("action", "").strip().lower()
+        action = _field(task, "action").lower()
         if action not in ("add_task", "add_update", "update_task"):
             continue
 
@@ -540,7 +540,7 @@ def process_tasks(conn, tasks_list, session_id=None):
             task_id = _parse_id(task.get("task_id"), "task_id", action, session_id)
             if task_id is None:
                 continue
-            content = task.get("content", "").strip()
+            content = _field(task, "content")
             if not content:
                 _skip(session_id, action, "missing content")
                 continue
@@ -566,7 +566,7 @@ def process_tasks(conn, tasks_list, session_id=None):
             task_id = _parse_id(task.get("task_id"), "task_id", action, session_id)
             if task_id is None:
                 continue
-            content = task.get("content", "").strip()
+            content = _field(task, "content")
             if not conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
             ).fetchone():
@@ -576,28 +576,28 @@ def process_tasks(conn, tasks_list, session_id=None):
             # Build SET clause — skip invalid enum values
             sets = []
             params = []
-            status = task.get("status", "").strip().lower()
+            status = _field(task, "status").lower()
             if status:
                 if status not in VALID_STATUS:
                     _skip(session_id, action, "invalid status", status=status)
                     continue
                 sets.append("status = ?")
                 params.append(status)
-            priority = task.get("priority", "").strip().lower()
+            priority = _field(task, "priority").lower()
             if priority:
                 if priority not in VALID_PRIORITY:
                     _skip(session_id, action, "invalid priority", priority=priority)
                     continue
                 sets.append("priority = ?")
                 params.append(priority)
-            horizon = task.get("horizon", "").strip().lower()
+            horizon = _field(task, "horizon").lower()
             if horizon:
                 if horizon not in VALID_HORIZON:
                     _skip(session_id, action, "invalid horizon", horizon=horizon)
                     continue
                 sets.append("horizon = ?")
                 params.append(horizon)
-            title = task.get("title", "").strip()
+            title = _field(task, "title")
             if title:
                 sets.append("title = ?")
                 params.append(title)
@@ -626,19 +626,19 @@ def process_tasks(conn, tasks_list, session_id=None):
             continue
 
         # add_task: new task
-        title = task.get("title", "").strip()
+        title = _field(task, "title")
         if not title:
             _skip(session_id, action, "missing title")
             continue
-        domain = task.get("domain", "").strip().lower()
+        domain = _field(task, "domain").lower()
         if not domain or domain not in VALID_DOMAINS:
             _skip(session_id, action, "invalid domain", domain=domain)
             continue
-        priority = task.get("priority", "").strip().lower()
+        priority = _field(task, "priority").lower()
         if not priority or priority not in VALID_PRIORITY:
             _skip(session_id, action, "invalid priority", priority=priority)
             continue
-        horizon = task.get("horizon", "").strip().lower()
+        horizon = _field(task, "horizon").lower()
         if not horizon or horizon not in VALID_HORIZON:
             _skip(session_id, action, "invalid horizon", horizon=horizon)
             continue

@@ -216,6 +216,31 @@ class SourcingRulesTest(unittest.TestCase):
         )
 
 
+class TaskFieldsTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = fresh_db()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_null_or_non_string_task_fields_skip_the_item_without_failing(self):
+        good = {"title": "Set up CI", "domain": "technical", "priority": "medium",
+                "horizon": "soon", "action": "add_task"}
+        bad = [
+            {**good, "title": None},
+            {**good, "domain": None},
+            {**good, "priority": 3},
+            {**good, "action": None},
+            {"action": "add_update", "task_id": 1, "content": None},
+            {"action": "update_task", "task_id": 1, "status": None, "content": None},
+        ]
+        analyze.process_tasks(self.conn, bad + [good], SID)
+        self.assertEqual(
+            [tuple(r) for r in self.conn.execute("SELECT title, priority FROM tasks")],
+            [("Set up CI", "medium")],
+        )
+
+
 class AssessmentContextTest(unittest.TestCase):
     def setUp(self):
         self.conn = fresh_db()
