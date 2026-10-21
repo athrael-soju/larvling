@@ -161,7 +161,8 @@ def get_desired_schema():
 # decay goes by.
 TOUCH_TRIGGER = (
     "CREATE TRIGGER IF NOT EXISTS updates_touch_task AFTER INSERT ON updates BEGIN "
-    "UPDATE tasks SET updated = datetime('now') WHERE id = new.task_id; END"
+    "UPDATE tasks SET updated = new.timestamp WHERE id = new.task_id "
+    "AND (julianday(updated) IS NULL OR julianday(new.timestamp) > julianday(updated)); END"
 )
 
 

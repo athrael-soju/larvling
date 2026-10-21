@@ -207,6 +207,23 @@ class DecayTest(unittest.TestCase):
         self.briefing()
         self.assertEqual(self.horizons()[self.overdue], "now")
 
+    def test_a_due_task_already_in_now_that_the_user_defers_stays_deferred(self):
+        self.briefing()  # stale_now_due is due soon and already in now
+        with db.open_db() as conn:
+            analyze.process_tasks(conn, [{"action": "update_task", "task_id": self.stale_now_due,
+                                          "horizon": "later", "content": "After the audit."}], SID)
+        self.briefing()
+        self.assertEqual(self.horizons()[self.stale_now_due], "later")
+        self.assertEqual(notes(self.stale_now_due), ["After the audit."])
+
+    def test_an_update_dated_earlier_does_not_move_last_touched_back(self):
+        run_query(f"INSERT INTO updates (task_id, content, timestamp) "
+                  f"VALUES ({self.fresh_now}, 'Imported note', '2020-01-01 00:00:00')")
+        with db.open_db() as conn:
+            days = conn.execute("SELECT julianday('now') - julianday(updated) FROM tasks WHERE id = ?",
+                                (self.fresh_now,)).fetchone()[0]
+        self.assertLess(days, 3)
+
     def test_tidy_reclassify_and_merge_count_as_touches(self):
         horizon = recipe("agents/knowledge-maintenance.md", "UPDATE tasks SET horizon")
         run_query(fill(horizon, horizon="now", id=self.stale_soon))

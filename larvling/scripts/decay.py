@@ -2,7 +2,8 @@
 
 Runs in code at SessionStart, so it doesn't depend on the model:
 - an open task due within due_soon_days moves to 'now', whatever its age,
-  once per due date, so a user who moves it back out is listened to;
+  once per due date (recorded as due_promoted in tasks.metadata, also for a
+  task that was already in 'now'), so a user who moves it out is listened to;
 - an open 'now' task untouched for decay_now_days moves to 'soon';
 - an open 'soon' task untouched for decay_soon_days is a drop candidate,
   listed in the briefing but never dropped automatically.
@@ -19,6 +20,11 @@ _DUE_SOON = (
     "AND due <= date('now', 'localtime', ?)"
 )
 _UNTOUCHED = "julianday(updated) < julianday('now', ?)"
+_VALID_META = "json_valid(COALESCE(metadata, '{}'))"
+# Not yet moved for this due date. Malformed metadata can't hold the mark.
+_NOT_PROMOTED = (
+    f"(NOT {_VALID_META} OR json_extract(COALESCE(metadata, '{{}}'), '$.due_promoted') IS NOT due)"
+)
 _AGE = "CAST(julianday('now') - julianday(updated) AS INTEGER) AS age"
 
 
@@ -58,15 +64,20 @@ def decay_tasks(conn, cfg):
     promoted = []
     if cfg["due_soon_days"]:
         rows = conn.execute(
-            "SELECT id, title, due, updated FROM tasks WHERE status = 'open' "
-            f"AND horizon != 'now' AND {_DUE_SOON} "
-            "AND NOT EXISTS (SELECT 1 FROM updates u WHERE u.task_id = tasks.id "
-            "AND u.content = 'Moved to now automatically: due ' || tasks.due || '.')",
+            "SELECT id, title, due, updated, horizon FROM tasks WHERE status = 'open' "
+            f"AND {_DUE_SOON} AND {_NOT_PROMOTED}",
             (_days(cfg["due_soon_days"]),),
         ).fetchall()
-        promoted = [
-            t for t in rows if _move(conn, t, "now", "horizon != 'now'", _promoted_note(t["due"]))
-        ]
+        for t in rows:
+            if t["horizon"] != "now" and _move(
+                conn, t, "now", "horizon != 'now'", _promoted_note(t["due"])
+            ):
+                promoted.append(t)
+            conn.execute(
+                "UPDATE tasks SET metadata = json_set(COALESCE(metadata, '{}'), "
+                f"'$.due_promoted', due) WHERE id = ? AND {_VALID_META}",
+                (t["id"],),
+            )
 
     demoted = []
     if cfg["decay_now_days"]:

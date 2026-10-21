@@ -78,7 +78,7 @@ Use `/query` to run any SQL against larvling.db. Claude writes the SQL based on 
 
 **JSON metadata columns** (query with `json_extract(metadata, '$.field')`):
 
-- `tasks.metadata` — optional. Populated on `add_task` with `{"source_session_id": "<sid>"}` when a real session id is known; NULL otherwise. Trace a task back to the session that produced it with `json_extract(metadata, '$.source_session_id')`.
+- `tasks.metadata` — optional. Populated on `add_task` with `{"source_session_id": "<sid>"}` when a real session id is known; NULL otherwise. Trace a task back to the session that produced it with `json_extract(metadata, '$.source_session_id')`. Task decay adds `due_promoted` (the due date it last moved the task to `now` for, or found it already there) so it moves a task once per due date.
 - `messages.metadata` — populated by hooks on every turn:
   - user messages: `{"cwd", "permission_mode", "usage": {input_tokens_estimate}}`
   - assistant messages: `{"tool_calls": {<tool>: <count>}, "usage": {input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens, ...}}`
